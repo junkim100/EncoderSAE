@@ -1,0 +1,33 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.env
+
+# IDE/editor
+.vscode/
+.idea/
+*.code-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# uv / tooling
+.python-version
+.ruff_cache/
+.pytest_cache/
+
+# Output directories
+activations/
+checkpoints/
+*.pt
+wandb/
+data/
+cache/

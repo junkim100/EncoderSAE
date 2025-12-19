@@ -1,0 +1,30 @@
+[project]
+name = "encodersae"
+version = "0.1.0"
+description = "Sparse Autoencoder for Encoder-only Models"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.30.0",
+    "datasets>=2.14.0",
+    "fire>=0.5.0",
+    "wandb>=0.15.0",
+    "tqdm>=4.65.0",
+    "numpy>=1.24.0",
+    "vllm>=0.2.0",
+]
+
+[project.scripts]
+encodersae = "EncoderSAE.main:main"
+encodersae-analyze = "EncoderSAE.analyze_main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["EncoderSAE"]
+
+[tool.hatch.build.targets.sdist]
+include = ["EncoderSAE", "pyproject.toml", "README.md"]
