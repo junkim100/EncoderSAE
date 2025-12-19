@@ -112,14 +112,13 @@ class EncoderSAE(nn.Module):
         explained_variance = total_variance - residual.pow(2).mean()
         fvu = 1.0 - (explained_variance / (total_variance + 1e-8))
 
-        # Dead feature percentage (features that never fired in this batch)
+        # Dead feature fraction (features that never fired in this batch), in [0, 1]
         dead_features = (features.abs().max(dim=0)[0] == 0).float().mean()
-        dead_feature_pct = dead_features.item() * 100.0
 
         metrics = {
             "loss": mse_loss.item(),
             "fvu": fvu.item(),
-            "dead_feature_pct": dead_feature_pct,
+            "dead_features": dead_features.item(),
             "l1_loss": l1_loss.item() if l1_coeff > 0 else 0.0,
         }
 

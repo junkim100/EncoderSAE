@@ -143,7 +143,7 @@ uv run -m EncoderSAE.main --model="..." --dataset="..." --num_gpus=8
    - Applies **mean pooling** across tokens (with attention mask)
    - Optionally caches pooled vectors to `.pt` files
 3. **Training**: Trains SAE on the pooled sentence embeddings
-4. **Metrics**: Tracks `loss`, `fvu` (Fraction of Variance Unexplained), `dead_feature_pct`, and `l0_norm`
+4. **Metrics**: Tracks `loss`, `fvu` (Fraction of Variance Unexplained), `dead_features`, and `l0_norm`
 
 ## Metrics
 
@@ -151,7 +151,7 @@ The training loop logs the following metrics to WandB:
 
 - **loss**: Mean squared error reconstruction loss
 - **fvu**: Fraction of Variance Unexplained (lower is better)
-- **dead_feature_pct**: Percentage of features that never fired
+- **dead_features**: Fraction of features that never fired in the batch
 - **l0_norm**: Average number of active features per sample
 
 ## Example: Training on Custom Data
@@ -219,20 +219,6 @@ EncoderSAE/
 - Python >= 3.8
 - PyTorch >= 2.0.0
 - CUDA/MPS support (optional, for GPU acceleration)
-
-## Publishing
-
-To build and publish EncoderSAE as a package:
-
-```bash
-# Build sdist and wheel
-uv build
-
-# (Optional) Publish to PyPI or your own index
-# uv publish --index-url https://upload.pypi.org/legacy/
-```
-
-The build configuration is defined in `pyproject.toml` using the `hatchling` backend, and packages the `EncoderSAE` directory as the main module.
 
 ## License
 

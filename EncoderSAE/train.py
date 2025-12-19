@@ -82,7 +82,7 @@ def train_sae(
         val_losses = []
         val_metrics = {
             "fvu": [],
-            "dead_feature_pct": [],
+            "dead_features": [],
             "l0_norm": [],
         }
 
@@ -96,7 +96,7 @@ def train_sae(
 
                 val_losses.append(metrics["loss"])
                 val_metrics["fvu"].append(metrics["fvu"])
-                val_metrics["dead_feature_pct"].append(metrics["dead_feature_pct"])
+                val_metrics["dead_features"].append(metrics["dead_features"])
                 # Handle DataParallel: l0_norm may be a tensor with one value per GPU
                 if isinstance(l0_norm, torch.Tensor) and l0_norm.numel() > 1:
                     val_metrics["l0_norm"].append(l0_norm.mean().item())
@@ -110,16 +110,14 @@ def train_sae(
 
         val_loss = sum(val_losses) / len(val_losses)
         val_fvu = sum(val_metrics["fvu"]) / len(val_metrics["fvu"])
-        val_dead = sum(val_metrics["dead_feature_pct"]) / len(
-            val_metrics["dead_feature_pct"]
-        )
+        val_dead = sum(val_metrics["dead_features"]) / len(val_metrics["dead_features"])
         val_l0 = sum(val_metrics["l0_norm"]) / len(val_metrics["l0_norm"])
 
         wandb.log(
             {
                 "val/loss": val_loss,
                 "val/fvu": val_fvu,
-                "val/dead_feature_pct": val_dead,
+                "val/dead_features": val_dead,
                 "val/l0_norm": val_l0,
                 "epoch": current_epoch + 1,
                 "step": global_step,
@@ -128,7 +126,7 @@ def train_sae(
 
         print(
             f"[val @ step {global_step}] Epoch {current_epoch+1} - "
-            f"Val Loss: {val_loss:.4f}, Val FVU: {val_fvu:.4f}, Val Dead%: {val_dead:.2f}"
+            f"Val Loss: {val_loss:.4f}, Val FVU: {val_fvu:.4f}, Val DeadFrac: {val_dead:.4f}"
         )
 
     for epoch in range(epochs):
@@ -136,7 +134,7 @@ def train_sae(
         train_losses = []
         train_metrics = {
             "fvu": [],
-            "dead_feature_pct": [],
+            "dead_features": [],
             "l0_norm": [],
         }
 
@@ -167,7 +165,7 @@ def train_sae(
             # Accumulate metrics
             train_losses.append(metrics["loss"])
             train_metrics["fvu"].append(metrics["fvu"])
-            train_metrics["dead_feature_pct"].append(metrics["dead_feature_pct"])
+            train_metrics["dead_features"].append(metrics["dead_features"])
             # Handle DataParallel: l0_norm may be a tensor with one value per GPU
             if isinstance(l0_norm, torch.Tensor) and l0_norm.numel() > 1:
                 train_metrics["l0_norm"].append(l0_norm.mean().item())
@@ -186,8 +184,8 @@ def train_sae(
                 avg_fvu = sum(train_metrics["fvu"][-log_steps:]) / min(
                     log_steps, len(train_metrics["fvu"])
                 )
-                avg_dead = sum(train_metrics["dead_feature_pct"][-log_steps:]) / min(
-                    log_steps, len(train_metrics["dead_feature_pct"])
+                avg_dead = sum(train_metrics["dead_features"][-log_steps:]) / min(
+                    log_steps, len(train_metrics["dead_features"])
                 )
                 avg_l0 = sum(train_metrics["l0_norm"][-log_steps:]) / min(
                     log_steps, len(train_metrics["l0_norm"])
@@ -196,7 +194,7 @@ def train_sae(
                 log_dict = {
                     "train/loss": avg_loss,
                     "train/fvu": avg_fvu,
-                    "train/dead_feature_pct": avg_dead,
+                    "train/dead_features": avg_dead,
                     "train/l0_norm": avg_l0,
                     "epoch": epoch + 1,
                     "step": global_step,
@@ -207,7 +205,7 @@ def train_sae(
                     {
                         "loss": f"{avg_loss:.4f}",
                         "fvu": f"{avg_fvu:.4f}",
-                        "dead%": f"{avg_dead:.2f}",
+                        "dead_frac": f"{avg_dead:.4f}",
                     }
                 )
 
@@ -236,8 +234,8 @@ def train_sae(
         # Epoch-level logging
         epoch_loss = sum(train_losses) / len(train_losses)
         epoch_fvu = sum(train_metrics["fvu"]) / len(train_metrics["fvu"])
-        epoch_dead = sum(train_metrics["dead_feature_pct"]) / len(
-            train_metrics["dead_feature_pct"]
+        epoch_dead = sum(train_metrics["dead_features"]) / len(
+            train_metrics["dead_features"]
         )
         epoch_l0 = sum(train_metrics["l0_norm"]) / len(train_metrics["l0_norm"])
 
@@ -245,7 +243,7 @@ def train_sae(
             {
                 "train/epoch_loss": epoch_loss,
                 "train/epoch_fvu": epoch_fvu,
-                "train/epoch_dead_feature_pct": epoch_dead,
+                "train/epoch_dead_features": epoch_dead,
                 "train/epoch_l0_norm": epoch_l0,
                 "epoch": epoch + 1,
             }
