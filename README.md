@@ -6,7 +6,7 @@ A production-ready Python library for training Sparse Autoencoders (SAEs) on **e
 
 - 🎯 **Sentence-level embeddings**: Extracts and trains on pooled sentence representations (not token-level)
 - 🔄 **Mean pooling**: Automatically applies mean pooling across tokens with attention mask support
-- 💾 **Activation caching**: Optionally cache extracted activations to disk for faster training
+- 💾 **Activation caching**: Optionally cache extracted activations to combined `.pt` files for faster training
 - 📊 **WandB integration**: Automatic experiment tracking with auto-generated run names
 - 🔧 **Flexible data loading**: Supports both local JSON/JSONL files and HuggingFace datasets
 - ⚡ **Top-K sparsity**: Efficient sparse activation via top-k feature selection
@@ -14,6 +14,7 @@ A production-ready Python library for training Sparse Autoencoders (SAEs) on **e
 - 🚀 **Multi-GPU support**: Efficient data-parallel training and activation extraction
 - ⚙️ **Auxiliary loss**: Configurable regularization to reduce dead features and improve feature utilization
 - 🔍 **Language analysis**: Built-in tools to analyze which SAE features correspond to different languages
+- 🔄 **Language-agnostic inference**: Full pipeline API for creating embeddings without language-specific features
 
 ## Installation
 
@@ -150,9 +151,8 @@ The model is initialized with tied weights (decoder = encoder^T).
 
 If you encounter the error `RuntimeError: Cannot re-initialize CUDA in forked subprocess`, this is because vLLM requires the multiprocessing start method to be set to `'spawn'` for CUDA compatibility.
 
-**Solution**: Set the environment variable before running:
+**Solution**: The library automatically sets this, but if you encounter issues, set the environment variable before running:
 
-```bash
 ```bash
 export PYTHON_MULTIPROCESSING_START_METHOD=spawn
 uv run -m EncoderSAE.main --model="..." --dataset="..." --num_gpus=8
@@ -303,7 +303,7 @@ This will:
    - Boolean tensor where 1 = language-specific in ANY language
    - Use this to remove ALL language-specific features at once
 
-### Key Arguments
+### Analysis Arguments
 
 - `mask_threshold`: Percentage threshold (0.0-1.0) for mask generation (default: 0.8 = 80%)
   - Features firing above this threshold for a language are considered language-specific
@@ -311,6 +311,54 @@ This will:
 - `top_k_features`: Number of features to show in JSON (default: None = show all)
   - Only affects JSON reporting, does NOT affect mask generation
   - Masks always check ALL features, filtered by `mask_threshold`
+
+### Using Masks for Language-Agnostic Embeddings
+
+The library provides a convenient pipeline for creating language-agnostic embeddings:
+
+#### Option 1: Full Pipeline (Recommended)
+
+```python
+from EncoderSAE import LanguageAgnosticEncoder
+
+# Initialize the encoder with SAE and mask
+encoder = LanguageAgnosticEncoder(
+    model_name="intfloat/multilingual-e5-large",
+    sae_path="checkpoints/.../final_model.pt",
+    mask_path="analysis/.../language_features_combined_mask.pt",
+    use_vllm=True,
+    num_gpus=8,
+)
+
+# Encode texts directly (handles: text -> base model -> SAE -> mask -> output)
+texts = ["Hello world", "Bonjour le monde", "Hola mundo"]
+language_agnostic_embeddings = encoder.encode(texts)
+# Shape: (3, dict_size) - language-specific features already removed
+```
+
+#### Option 2: Function-Based API
+
+```python
+from EncoderSAE import infer_language_agnostic, remove_language_features
+import torch
+
+# Full pipeline function
+embeddings = infer_language_agnostic(
+    model_name="intfloat/multilingual-e5-large",
+    sae_path="checkpoints/.../final_model.pt",
+    mask_path="analysis/.../language_features_combined_mask.pt",
+    texts=["Hello world", "Bonjour le monde"],
+    use_vllm=True,
+    num_gpus=8,
+)
+
+# Or apply mask to existing SAE features
+features = sae(activations)[1]  # Get SAE features
+mask = torch.load("analysis/.../language_features_combined_mask.pt")
+features_agnostic = remove_language_features(features, mask)
+```
+
+The masks are boolean tensors where `True` (1) indicates language-specific features that are set to 0 to preserve only contextual information.
 
 ## Project Structure
 
@@ -324,7 +372,8 @@ EncoderSAE/
 │   ├── utils.py         # WandB setup & utilities
 │   ├── main.py          # CLI entry point (training)
 │   ├── analyze.py       # Language feature analysis
-│   └── analyze_main.py  # CLI entry point (analysis)
+│   ├── analyze_main.py  # CLI entry point (analysis)
+│   └── inference.py     # Language-agnostic inference pipeline
 ├── run_main.py          # Wrapper script for multiprocessing compatibility
 ├── run_sweep.sh         # Hyperparameter sweep script
 ├── pyproject.toml       # Package configuration (uv/pip)

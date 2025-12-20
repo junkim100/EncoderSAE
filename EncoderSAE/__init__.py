@@ -16,6 +16,18 @@ except RuntimeError:
 
 __version__ = "0.1.0"
 
+from .inference import (
+    LanguageAgnosticEncoder,
+    infer_language_agnostic,
+    remove_language_features,
+)
+
+__all__ = [
+    "LanguageAgnosticEncoder",
+    "infer_language_agnostic",
+    "remove_language_features",
+]
+
 from .model import EncoderSAE
 from .data import ActivationDataset, load_data, extract_activations
 from .train import train_sae
