@@ -1,5 +1,7 @@
 """CLI entry point for language feature analysis."""
 
+from typing import Optional
+
 import fire
 
 from .analyze import analyze_language_features
@@ -13,7 +15,8 @@ def main(
     language_column: str = "language",
     batch_size: int = 32,
     max_length: int = 512,
-    top_k_features: int = 20,
+    top_k_features: Optional[int] = None,
+    mask_threshold: float = 0.8,
     output_dir: str = None,
     use_vllm: bool = True,
     num_gpus: int = None,
@@ -30,7 +33,9 @@ def main(
         language_column: Name of language column in validation data (default: "language")
         batch_size: Batch size for processing (default: 32)
         max_length: Maximum sequence length (default: 512)
-        top_k_features: Number of top features to report per language (default: 20)
+        top_k_features: Number of top features to report per language in JSON (default: None = show all features, for reporting only, does not affect masks)
+        mask_threshold: Percentage threshold (0.0-1.0) for mask generation (default: 0.8 = 80%).
+            Features firing above this threshold for a language are considered language-specific.
         output_dir: Directory to save analysis results (None = auto-generate)
         use_vllm: Use vLLM for faster inference (default: True)
         num_gpus: Number of GPUs to use (None = auto-detect all)
@@ -45,6 +50,7 @@ def main(
         batch_size=batch_size,
         max_length=max_length,
         top_k_features=top_k_features,
+        mask_threshold=mask_threshold,
         output_dir=output_dir,
         use_vllm=use_vllm,
         num_gpus=num_gpus,
@@ -57,4 +63,3 @@ def main(
 
 if __name__ == "__main__":
     fire.Fire(main)
-

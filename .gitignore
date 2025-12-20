@@ -31,3 +31,4 @@ checkpoints/
 wandb/
 data/
 cache/
+analysis/

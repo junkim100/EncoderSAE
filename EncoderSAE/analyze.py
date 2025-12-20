@@ -1,7 +1,10 @@
 """Analysis tools for identifying language-specific SAE features."""
 
 import json
+import os
+import sys
 from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -15,6 +18,28 @@ from .data import load_data, mean_pool, extract_activations
 from .utils import get_device
 
 
+@contextmanager
+def suppress_output():
+    """Temporarily suppress stdout/stderr to hide vLLM progress bars."""
+    import os
+    import sys
+
+    # Save original file descriptors
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+
+    # Redirect to devnull
+    with open(os.devnull, "w") as devnull:
+        sys.stdout = devnull
+        sys.stderr = devnull
+        try:
+            yield
+        finally:
+            # Restore original stdout/stderr
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+
+
 def analyze_language_features(
     sae_path: str,
     model_name: str,
@@ -23,7 +48,8 @@ def analyze_language_features(
     language_column: str = "language",
     batch_size: int = 32,
     max_length: int = 512,
-    top_k_features: int = 20,
+    top_k_features: Optional[int] = None,
+    mask_threshold: float = 0.5,
     output_dir: Optional[str] = None,
     use_vllm: bool = True,
     num_gpus: Optional[int] = None,
@@ -40,14 +66,16 @@ def analyze_language_features(
         language_column: Name of language column in validation data
         batch_size: Batch size for processing
         max_length: Maximum sequence length
-        top_k_features: Number of top features to report per language
+        top_k_features: Number of top features to report per language in JSON (None = show all features, for reporting only, does not affect masks)
+        mask_threshold: Percentage threshold (0.0-1.0) for mask generation. Features firing above this threshold
+            for a language are considered language-specific and included in the mask. Default: 0.5 (50%)
         output_dir: Directory to save analysis results (None = auto-generate)
         use_vllm: Use vLLM for faster inference
         num_gpus: Number of GPUs to use
         gpu_memory_utilization: GPU memory utilization for vLLM
 
     Returns:
-        Dictionary mapping language -> list of top feature indices
+        Dictionary mapping language -> analysis results
     """
     device = get_device()
     print(f"Using device: {device}")
@@ -114,6 +142,12 @@ def analyze_language_features(
     if use_vllm:
         # Use vLLM for faster extraction
         try:
+            # Suppress vLLM INFO logs and progress bars
+            import logging
+
+            vllm_logger = logging.getLogger("vllm")
+            vllm_logger.setLevel(logging.WARNING)
+
             from vllm import LLM
 
             llm = LLM(
@@ -124,6 +158,7 @@ def analyze_language_features(
                 gpu_memory_utilization=gpu_memory_utilization,
                 max_model_len=max_length,
                 task="embed",
+                disable_log_stats=True,  # Disable vLLM's internal progress stats
             )
 
             for language, texts in texts_by_language.items():
@@ -132,53 +167,108 @@ def analyze_language_features(
                 # Process in batches
                 num_batches = (len(texts) + batch_size - 1) // batch_size
 
-                for batch_idx in tqdm(range(num_batches), desc=f"{language}"):
+                for batch_idx in tqdm(
+                    range(num_batches), desc=f"{language}", leave=True
+                ):
                     start_idx = batch_idx * batch_size
                     end_idx = min(start_idx + batch_size, len(texts))
                     batch_texts = texts[start_idx:end_idx]
 
-                    # Get embeddings from vLLM
-                    # vLLM's embed() returns EmbeddingRequestOutput objects
-                    embedding_outputs = llm.embed(batch_texts)
+                    # Get embeddings from vLLM using encode() API
+                    # Suppress vLLM's internal progress bars ("Adding requests", "Processed prompts")
+                    # by redirecting stdout/stderr during the encode call
+                    try:
+                        with suppress_output():
+                            outputs = llm.encode(
+                                batch_texts, pooling_task="embed", use_tqdm=False
+                            )
+                    except Exception as e:
+                        # Re-raise with original stdout/stderr restored so error is visible
+                        print(f"Error during vLLM encode: {e}", file=sys.stderr)
+                        raise
 
-                    # Extract embeddings from EmbeddingRequestOutput objects
-                    # Structure: EmbeddingRequestOutput.outputs.embedding (list of floats)
-                    # Note: outputs can be a single EmbeddingOutput or a list
+                    # Extract embedding tensors with fallback logic (same as data.py)
                     embedding_tensors = []
-                    for embedding_output in embedding_outputs:
-                        if hasattr(embedding_output, "outputs"):
-                            # outputs might be a single EmbeddingOutput object or a list
-                            if hasattr(
-                                embedding_output.outputs, "__len__"
-                            ) and not isinstance(embedding_output.outputs, str):
-                                # It's a list/sequence - get first element
-                                if len(embedding_output.outputs) > 0:
-                                    embedding_data = embedding_output.outputs[
-                                        0
-                                    ].embedding
+                    for output in outputs:
+                        embedding_tensor = None
+
+                        # Try multiple extraction paths (fallback logic)
+                        if hasattr(output, "outputs"):
+                            if hasattr(output.outputs, "embedding"):
+                                embedding_data = output.outputs.embedding
+                                embedding_tensor = (
+                                    torch.tensor(embedding_data, dtype=torch.float32)
+                                    if not isinstance(embedding_data, torch.Tensor)
+                                    else embedding_data.to(dtype=torch.float32)
+                                )
+                            elif hasattr(output.outputs, "data"):
+                                embedding_data = output.outputs.data
+                                embedding_tensor = (
+                                    torch.tensor(embedding_data, dtype=torch.float32)
+                                    if not isinstance(embedding_data, torch.Tensor)
+                                    else embedding_data.to(dtype=torch.float32)
+                                )
+                            elif hasattr(output.outputs, "__len__") and not isinstance(
+                                output.outputs, str
+                            ):
+                                if len(output.outputs) > 0:
+                                    if hasattr(output.outputs[0], "embedding"):
+                                        embedding_data = output.outputs[0].embedding
+                                    elif hasattr(output.outputs[0], "data"):
+                                        embedding_data = output.outputs[0].data
+                                    else:
+                                        embedding_data = output.outputs[0]
+                                    embedding_tensor = (
+                                        torch.tensor(
+                                            embedding_data, dtype=torch.float32
+                                        )
+                                        if not isinstance(embedding_data, torch.Tensor)
+                                        else embedding_data.to(dtype=torch.float32)
+                                    )
                                 else:
                                     raise ValueError(
                                         "EmbeddingRequestOutput.outputs is empty"
                                     )
-                            else:
-                                # It's a single EmbeddingOutput object
-                                embedding_data = embedding_output.outputs.embedding
-                            embedding_tensor = torch.tensor(
-                                embedding_data, dtype=torch.float32
-                            )
-                        elif hasattr(embedding_output, "embedding"):
-                            embedding_data = embedding_output.embedding
+                        elif hasattr(output, "embedding"):
+                            embedding_data = output.embedding
                             embedding_tensor = (
                                 torch.tensor(embedding_data, dtype=torch.float32)
                                 if not isinstance(embedding_data, torch.Tensor)
-                                else embedding_data
+                                else embedding_data.to(dtype=torch.float32)
                             )
-                        elif isinstance(embedding_output, torch.Tensor):
-                            embedding_tensor = embedding_output
+                        elif isinstance(output, torch.Tensor):
+                            embedding_tensor = output.to(dtype=torch.float32)
+                        elif hasattr(output, "__array__"):
+                            import numpy as np
+
+                            embedding_tensor = torch.from_numpy(np.array(output)).to(
+                                dtype=torch.float32
+                            )
                         else:
-                            embedding_tensor = torch.tensor(
-                                embedding_output, dtype=torch.float32
+                            try:
+                                embedding_tensor = torch.tensor(
+                                    output, dtype=torch.float32
+                                )
+                            except:
+                                raise ValueError(
+                                    f"Cannot extract embedding from {type(output)}. "
+                                    f"Available attributes: {[attr for attr in dir(output) if not attr.startswith('_')]}"
+                                )
+
+                        if embedding_tensor is None:
+                            raise ValueError(
+                                f"Failed to extract embedding from {type(output)}"
                             )
+
+                        # Ensure it's float32
+                        if not isinstance(embedding_tensor, torch.Tensor):
+                            embedding_tensor = torch.tensor(
+                                embedding_tensor, dtype=torch.float32
+                            )
+
+                        if embedding_tensor.dtype != torch.float32:
+                            embedding_tensor = embedding_tensor.to(dtype=torch.float32)
+
                         embedding_tensors.append(embedding_tensor)
 
                     # Stack into batch tensor
@@ -188,7 +278,7 @@ def analyze_language_features(
 
                     # Pass through SAE to get features
                     with torch.no_grad():
-                        _, features, _ = sae(batch_activations)
+                        _, features, _, _ = sae(batch_activations)
 
                         # Count which features fired for this language
                         for sample_features in features:
@@ -238,7 +328,7 @@ def analyze_language_features(
                     batch_activations = mean_pool(hidden_states, attention_mask)
 
                     # Pass through SAE
-                    _, features, _ = sae(batch_activations)
+                    _, features, _, _ = sae(batch_activations)
 
                     # Count which features fired
                     for sample_features in features:
@@ -264,14 +354,23 @@ def analyze_language_features(
             feature_counts.items(), key=lambda x: x[1], reverse=True
         )
 
-        # Get top-k features
-        top_features = [
-            feat_idx for feat_idx, count in sorted_features[:top_k_features]
-        ]
-        top_features_with_counts = [
-            (feat_idx, count, count / total_samples * 100)
-            for feat_idx, count in sorted_features[:top_k_features]
-        ]
+        # Get top features (all if top_k_features is None, otherwise top k)
+        if top_k_features is None:
+            # Show all features
+            top_features = [feat_idx for feat_idx, count in sorted_features]
+            top_features_with_counts = [
+                (feat_idx, count, count / total_samples * 100)
+                for feat_idx, count in sorted_features
+            ]
+        else:
+            # Limit to top k
+            top_features = [
+                feat_idx for feat_idx, count in sorted_features[:top_k_features]
+            ]
+            top_features_with_counts = [
+                (feat_idx, count, count / total_samples * 100)
+                for feat_idx, count in sorted_features[:top_k_features]
+            ]
 
         results[language] = {
             "top_features": top_features,
@@ -283,15 +382,42 @@ def analyze_language_features(
         print(
             f"\n{language.upper()} ({total_samples} samples, {len(feature_counts)} unique features):"
         )
-        print(f"  Top {top_k_features} features:")
-        for feat_idx, count, pct in top_features_with_counts[:10]:
+        if top_k_features is None:
+            print(f"  All {len(top_features)} features:")
+            display_count = min(10, len(top_features_with_counts))
+        else:
+            print(f"  Top {top_k_features} features:")
+            display_count = min(10, len(top_features_with_counts))
+
+        for feat_idx, count, pct in top_features_with_counts[:display_count]:
             print(
                 f"    Feature {feat_idx:5d}: {count:4d} times ({pct:5.2f}% of samples)"
             )
 
     # Save results
     if output_dir is None:
-        output_dir = f"./analysis/{Path(sae_path).stem}"
+        # Generate output directory name from checkpoint path
+        # e.g., "checkpoints/model_dataset/exp64_k2048_lr0.001/final_model.pt"
+        # -> "analysis/model_dataset_exp64_k2048_lr0.001_final"
+        sae_path_obj = Path(sae_path)
+
+        # Get parent directory name (e.g., "exp64_k2048_lr0.001")
+        parent_dir = sae_path_obj.parent.name
+
+        # Get checkpoint name from filename (e.g., "final_model" or "checkpoint_step_6000")
+        checkpoint_name = sae_path_obj.stem
+
+        # Combine: model_dataset_exp64_k2048_lr0.001_final or model_dataset_exp64_k2048_lr0.001_step_6000
+        if checkpoint_name == "final_model":
+            analysis_dir_name = f"{parent_dir}_final"
+        elif checkpoint_name.startswith("checkpoint_step_"):
+            step_num = checkpoint_name.replace("checkpoint_step_", "")
+            analysis_dir_name = f"{parent_dir}_step_{step_num}"
+        else:
+            # Fallback: use checkpoint name as-is
+            analysis_dir_name = f"{parent_dir}_{checkpoint_name}"
+
+        output_dir = f"./analysis/{analysis_dir_name}"
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -315,5 +441,115 @@ def analyze_language_features(
         json.dump(json_results, f, indent=2, ensure_ascii=False)
 
     print(f"\nResults saved to {json_path}")
+
+    # Generate feature masks for each language
+    # Mask: 1 for features that fire above threshold percentage, 0 otherwise
+    # Note: This checks ALL features, not just top_k_features (top_k is only for JSON reporting)
+    print("\n" + "=" * 60)
+    print("Generating Language Feature Masks")
+    print("=" * 60)
+    print(f"Mask threshold: >{mask_threshold * 100:.1f}% of samples")
+    print(f"Dictionary size: {dict_size}")
+    if top_k_features is not None:
+        print(
+            f"Note: All features are checked for masks, not just top {top_k_features} (top_k is for JSON reporting only)"
+        )
+    else:
+        print("Note: All features are included in JSON output and checked for masks")
+
+    mask_threshold_pct = mask_threshold * 100.0
+    all_masks = {}  # Dictionary to store all language masks
+
+    for language in sorted(language_features.keys()):
+        # Create mask tensor: 1 for features with >50% usage, 0 otherwise
+        mask = torch.zeros(dict_size, dtype=torch.bool)
+
+        # Get all feature counts for this language (not just top_k)
+        feature_counts = language_features[language]
+        total_samples = len(texts_by_language[language])
+
+        # Check ALL features (not just top_k_features) and filter by percentage threshold
+        # This ensures we capture all language-specific features, regardless of how many exist
+        for feat_idx, count in feature_counts.items():
+            percentage = (count / total_samples) * 100.0
+            if percentage > mask_threshold_pct:
+                mask[feat_idx] = 1
+
+        # Count how many features are enabled for this language
+        num_enabled = mask.sum().item()
+
+        print(
+            f"\n{language.upper()}: {num_enabled} features enabled "
+            f"(>{mask_threshold_pct}% of {total_samples} samples)"
+        )
+
+        # Save individual mask as .pt file
+        mask_path = output_path / f"language_features_{language}_mask.pt"
+        torch.save(mask, mask_path)
+        print(f"  Saved mask to {mask_path}")
+
+        # Store in combined dictionary
+        all_masks[language] = mask
+
+    # Save combined mask file with all languages
+    combined_mask_path = output_path / "language_features_combined_masks.pt"
+    torch.save(all_masks, combined_mask_path)
+    print(f"\nCombined masks saved to {combined_mask_path}")
+    print(
+        f"  Contains masks for {len(all_masks)} languages: {', '.join(sorted(all_masks.keys()))}"
+    )
+
+    # Create combined index of all language-specific features (union across all languages)
+    # This is the set of all features that fire >threshold% for at least one language
+    all_language_specific_features = set()
+    for language, mask in all_masks.items():
+        # Get indices where mask is True (feature fires >threshold% for this language)
+        language_feature_indices = mask.nonzero(as_tuple=True)[0].tolist()
+        all_language_specific_features.update(language_feature_indices)
+
+    # Convert to sorted list for easy use
+    all_language_specific_features_list = sorted(list(all_language_specific_features))
+
+    # Save combined feature index
+    combined_index_path = output_path / "language_features_combined_index.pt"
+    torch.save(
+        {
+            "feature_indices": torch.tensor(
+                all_language_specific_features_list, dtype=torch.long
+            ),
+            "num_features": len(all_language_specific_features_list),
+            "languages": sorted(all_masks.keys()),
+            "mask_threshold": mask_threshold,
+        },
+        combined_index_path,
+    )
+    print(f"\nCombined feature index saved to {combined_index_path}")
+    print(
+        f"  Total language-specific features (union across all languages): {len(all_language_specific_features_list)}"
+    )
+    print(
+        f"  These features fire >{mask_threshold * 100:.1f}% for at least one language"
+    )
+
+    # Also create a combined union mask
+    # This mask is 1 for ANY feature that is language-specific in ANY language
+    # Use this to remove ALL language-specific features at once
+    combined_mask = torch.zeros(dict_size, dtype=torch.bool)
+    for mask in all_masks.values():
+        combined_mask |= (
+            mask  # Union: 1 if feature is language-specific in any language
+        )
+
+    combined_mask_path_union = output_path / "language_features_combined_mask.pt"
+    torch.save(combined_mask, combined_mask_path_union)
+    print(f"\nCombined union mask saved to {combined_mask_path_union}")
+    print(
+        f"  Contains {combined_mask.sum().item()} features that are language-specific in at least one language"
+    )
+    print(
+        f"  Usage: features_agnostic = features * (~combined_mask)  # Remove all language-specific features"
+    )
+
+    print(f"\nAll language masks and indices saved to {output_path}")
 
     return results

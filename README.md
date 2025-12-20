@@ -259,14 +259,14 @@ Edit `run_sweep.sh` to customize the sweep ranges. Each run is automatically log
 
 ## Language Feature Analysis
 
-After training an SAE, you can analyze which features correspond to which languages:
+After training an SAE, you can analyze which features correspond to which languages and generate masks to remove language-specific information:
 
 ```bash
 uv run -m EncoderSAE.analyze_main \
-    --sae_path="./checkpoints/model_dataset/final_model.pt" \
+    --sae_path="./checkpoints/model_dataset/exp64_k2048_lr0.001/final_model.pt" \
     --validation_data="data/4lang_validation.jsonl" \
     --model="intfloat/multilingual-e5-large" \
-    --top_k_features=20 \
+    --mask_threshold=0.8 \
     --use_vllm \
     --num_gpus=8
 ```
@@ -274,15 +274,43 @@ uv run -m EncoderSAE.analyze_main \
 This will:
 
 - Load your trained SAE checkpoint
-- Process the validation set grouped by language
+- Process the validation set grouped by language (automatically detects all languages)
 - Identify which SAE features fire most frequently for each language
-- Save results to `./analysis/{checkpoint_name}/language_features.json`
+- Generate feature masks for language-specific feature removal
+- Save results to `./analysis/{hyperparams}_{checkpoint}/`
 
-The output includes:
+### Output Files
 
-- Top feature indices per language
-- Feature activation frequencies
-- Percentage of samples where each feature fires
+1. **`language_features.json`**: Analysis results with feature frequencies per language
+   - `top_features`: List of feature indices (all features if `top_k_features=None`)
+   - `top_features_detailed`: Feature indices with counts and percentages
+   - `total_samples`: Number of samples per language
+   - `unique_features`: Number of unique features that fired
+
+2. **`language_features_{language}_mask.pt`**: Individual mask per language
+   - Boolean tensor (dict_size,) where 1 = feature fires >threshold% for that language
+   - Use to remove language-specific features for a specific language
+
+3. **`language_features_combined_masks.pt`**: Dictionary of all language masks
+   - `{language: mask_tensor}` for all languages
+   - Convenient way to load all masks at once
+
+4. **`language_features_combined_index.pt`**: Combined feature index
+   - Contains tensor of all language-specific feature indices (union across languages)
+   - Metadata: number of features, languages, mask_threshold used
+
+5. **`language_features_combined_mask.pt`**: Union mask for all languages
+   - Boolean tensor where 1 = language-specific in ANY language
+   - Use this to remove ALL language-specific features at once
+
+### Key Arguments
+
+- `mask_threshold`: Percentage threshold (0.0-1.0) for mask generation (default: 0.8 = 80%)
+  - Features firing above this threshold for a language are considered language-specific
+  - Higher values = more strict (fewer features marked as language-specific)
+- `top_k_features`: Number of features to show in JSON (default: None = show all)
+  - Only affects JSON reporting, does NOT affect mask generation
+  - Masks always check ALL features, filtered by `mask_threshold`
 
 ## Project Structure
 
