@@ -86,6 +86,7 @@ def train_sae(
             "fvu": [],
             "dead_features": [],
             "l0_norm": [],
+            "aux_loss": [],
         }
 
         with torch.no_grad():
@@ -104,6 +105,7 @@ def train_sae(
                 val_losses.append(metrics["loss"])
                 val_metrics["fvu"].append(metrics["fvu"])
                 val_metrics["dead_features"].append(metrics["dead_features"])
+                val_metrics["aux_loss"].append(metrics["aux_loss"])
                 # Handle DataParallel: l0_norm may be a tensor with one value per GPU
                 if isinstance(l0_norm, torch.Tensor) and l0_norm.numel() > 1:
                     val_metrics["l0_norm"].append(l0_norm.mean().item())
@@ -119,6 +121,7 @@ def train_sae(
         val_fvu = sum(val_metrics["fvu"]) / len(val_metrics["fvu"])
         val_dead = sum(val_metrics["dead_features"]) / len(val_metrics["dead_features"])
         val_l0 = sum(val_metrics["l0_norm"]) / len(val_metrics["l0_norm"])
+        val_aux = sum(val_metrics["aux_loss"]) / len(val_metrics["aux_loss"])
 
         wandb.log(
             {
@@ -126,6 +129,7 @@ def train_sae(
                 "val/fvu": val_fvu,
                 "val/dead_features": val_dead,
                 "val/l0_norm": val_l0,
+                "val/aux_loss": val_aux,
                 "epoch": current_epoch + 1,
                 "step": global_step,
             }
@@ -133,7 +137,7 @@ def train_sae(
 
         print(
             f"[val @ step {global_step}] Epoch {current_epoch+1} - "
-            f"Val Loss: {val_loss:.4f}, Val FVU: {val_fvu:.4f}, Val DeadFrac: {val_dead:.4f}"
+            f"Val Loss: {val_loss:.4f}, Val FVU: {val_fvu:.4f}, Val DeadFrac: {val_dead:.4f}, Val AuxLoss: {val_aux:.6f}"
         )
 
     for epoch in range(epochs):
@@ -143,6 +147,7 @@ def train_sae(
             "fvu": [],
             "dead_features": [],
             "l0_norm": [],
+            "aux_loss": [],
         }
 
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
@@ -178,6 +183,7 @@ def train_sae(
             train_losses.append(metrics["loss"])
             train_metrics["fvu"].append(metrics["fvu"])
             train_metrics["dead_features"].append(metrics["dead_features"])
+            train_metrics["aux_loss"].append(metrics["aux_loss"])
             # Handle DataParallel: l0_norm may be a tensor with one value per GPU
             if isinstance(l0_norm, torch.Tensor) and l0_norm.numel() > 1:
                 train_metrics["l0_norm"].append(l0_norm.mean().item())
@@ -202,12 +208,16 @@ def train_sae(
                 avg_l0 = sum(train_metrics["l0_norm"][-log_steps:]) / min(
                     log_steps, len(train_metrics["l0_norm"])
                 )
+                avg_aux = sum(train_metrics["aux_loss"][-log_steps:]) / min(
+                    log_steps, len(train_metrics["aux_loss"])
+                )
 
                 log_dict = {
                     "train/loss": avg_loss,
                     "train/fvu": avg_fvu,
                     "train/dead_features": avg_dead,
                     "train/l0_norm": avg_l0,
+                    "train/aux_loss": avg_aux,
                     "epoch": epoch + 1,
                     "step": global_step,
                 }
@@ -250,6 +260,7 @@ def train_sae(
             train_metrics["dead_features"]
         )
         epoch_l0 = sum(train_metrics["l0_norm"]) / len(train_metrics["l0_norm"])
+        epoch_aux = sum(train_metrics["aux_loss"]) / len(train_metrics["aux_loss"])
 
         wandb.log(
             {
@@ -257,6 +268,7 @@ def train_sae(
                 "train/epoch_fvu": epoch_fvu,
                 "train/epoch_dead_features": epoch_dead,
                 "train/epoch_l0_norm": epoch_l0,
+                "train/epoch_aux_loss": epoch_aux,
                 "epoch": epoch + 1,
             }
         )
