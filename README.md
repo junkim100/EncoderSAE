@@ -1,6 +1,6 @@
 # EncoderSAE
 
-A production-ready Python library for training Sparse Autoencoders (SAEs) on **encoder-only models** (e.g., BERT, RoBERTa). Unlike standard SAEs that train on token-level residual streams, EncoderSAE trains on **sentence-level embeddings** using mean pooling.
+A production-ready Python library for training Sparse Autoencoders (SAEs) on **encoder-only models** (e.g., BERT, RoBERTa, multilingual E5). Unlike standard SAEs that train on token-level residual streams, EncoderSAE trains on **sentence-level embeddings** using mean pooling.
 
 ## Features
 
@@ -11,14 +11,30 @@ A production-ready Python library for training Sparse Autoencoders (SAEs) on **e
 - 🔧 **Flexible data loading**: Supports both local JSON/JSONL files and HuggingFace datasets
 - ⚡ **Top-K sparsity**: Efficient sparse activation via top-k feature selection
 - 🎛️ **Fire CLI**: Clean command-line interface with sensible defaults
+- 🚀 **Multi-GPU support**: Efficient data-parallel training and activation extraction
+- ⚙️ **Auxiliary loss**: Configurable regularization to reduce dead features and improve feature utilization
+- 🔍 **Language analysis**: Built-in tools to analyze which SAE features correspond to different languages
 
 ## Installation
 
-Install the package:
+### Using uv (recommended)
 
 ```bash
 uv pip install -e .
 ```
+
+### Using pip
+
+```bash
+pip install -e .
+```
+
+### Requirements
+
+- Python >= 3.8
+- PyTorch >= 2.0.0
+- CUDA/MPS support (optional, for GPU acceleration)
+- vLLM (optional, for faster activation extraction with `--use_vllm`)
 
 ## Quick Start
 
@@ -31,6 +47,7 @@ uv run -m EncoderSAE.main
 ```
 
 This will:
+
 - Use model: `intfloat/multilingual-e5-large`
 - Use dataset: `enjalot/fineweb-edu-sample-10BT-chunked-500-nomic-text-v1.5`
 - Extract sentence-level embeddings via mean pooling
@@ -78,19 +95,34 @@ The model is initialized with tied weights (decoder = encoder^T).
 ## Key Arguments
 
 ### Model & Data
+
 - `model`: HuggingFace model ID or local path (default: `"intfloat/multilingual-e5-large"`)
 - `dataset`: HuggingFace dataset ID or local JSON/JSONL file (default: `"enjalot/fineweb-edu-sample-10BT-chunked-500-nomic-text-v1.5"`)
 - `text_column`: Name of text column in dataset (default: `"text"`)
 
 ### SAE Hyperparameters
+
 - `expansion_factor`: Dictionary size multiplier (default: `32`)
-- `sparsity`: Number of top features to keep (default: `64`)
+  - Dictionary size = `input_dim × expansion_factor`
+  - Larger values create more features but may increase dead features
+- `sparsity`: Number of top features to keep per sample (default: `64`)
+  - Controls sparsity ratio: `sparsity / dict_size`
+  - Recommended: 0.5% - 2% of dictionary size for good feature utilization
 - `batch_size`: SAE training batch size (default: `32`)
 - `epochs`: Number of training epochs (default: `1`)
 - `lr`: Learning rate (default: `3e-4`)
+  - Recommended: `1e-3` to `5e-4` for most cases
 - `grad_acc_steps`: Gradient accumulation steps (default: `1`)
+- `aux_loss_coeff`: Coefficient for auxiliary loss that encourages feature usage (default: `1e-3`)
+  - Set to `0.0` to disable auxiliary loss
+  - Higher values more aggressively reduce dead features
+  - Recommended: `1e-3` to `1e-2` for models with high dead feature rates
+- `aux_loss_target`: Target fraction of samples where each feature should appear in top-k (default: `0.01`)
+  - Features used less than this fraction are penalized
+  - Recommended: `0.005` (0.5%) to `0.02` (2%) depending on desired feature specialization
 
 ### Data & Caching
+
 - `save_activations`: Cache activations to disk (default: `True`)
 - `activations_dir`: Directory for cached activations (auto-generated as `./activations/{model}_{dataset}` if `None`)
 - `val_set`: Path to validation activations directory (if precomputed). Ignored if `val_dataset` is provided; if both are `None`, 5% of train is auto-split for validation.
@@ -119,20 +151,40 @@ The model is initialized with tied weights (decoder = encoder^T).
 If you encounter the error `RuntimeError: Cannot re-initialize CUDA in forked subprocess`, this is because vLLM requires the multiprocessing start method to be set to `'spawn'` for CUDA compatibility.
 
 **Solution**: Set the environment variable before running:
+
+```bash
 ```bash
 export PYTHON_MULTIPROCESSING_START_METHOD=spawn
 uv run -m EncoderSAE.main --model="..." --dataset="..." --num_gpus=8
 ```
 
+### Training & Validation
+
+- `val_step`: Run validation every N training steps (default: `1000`)
+  - Set to `None` or `<=0` for end-of-epoch validation only
+  - Useful for monitoring overfitting during training
+- `val_set`: Path to validation activations directory (if precomputed)
+  - Auto-detects `.pt` file if directory is provided
+  - Ignored if `val_dataset` is provided
+- `val_dataset`: HuggingFace dataset ID or local JSON/JSONL file for validation
+  - If provided, a separate validation activation set is extracted
+  - `val_split` is ignored when this is set
+
 ### Logging
+
 - `wandb_project`: WandB project name (default: `"encodersae"`)
 - `wandb_run_name`: Custom run name (auto-generated if `None`)
 - `log_steps`: Log metrics every N steps (default: `10`)
 - `seed`: Random seed (default: `42`)
 
 ### Output
-- `save_dir`: Directory to save model checkpoints (auto-generated as `./checkpoints/{model}_{dataset}` if `None`)
+
+- `save_dir`: Directory to save model checkpoints
+  - Auto-generated as `./checkpoints/{model}_{dataset}/exp{expansion_factor}_k{sparsity}_lr{lr}` if `None`
+  - Creates hyperparameter-specific subdirectories for easy organization
 - `checkpoint_steps`: Save checkpoints every N training steps (default: `1000`)
+  - Checkpoints saved as `checkpoint_step_{step}.pt`
+  - Final model saved as `final_model.pt`
 
 ## How It Works
 
@@ -151,26 +203,59 @@ The training loop logs the following metrics to WandB:
 
 - **loss**: Mean squared error reconstruction loss
 - **fvu**: Fraction of Variance Unexplained (lower is better)
-- **dead_features**: Fraction of features that never fired in the batch
+  - Measures reconstruction quality: `1 - (explained_variance / total_variance)`
+  - Lower values indicate better reconstruction
+- **dead_features**: Fraction of features that never fired in the batch (0-1)
+  - Lower values indicate better feature utilization
+  - Target: < 0.3 (30% dead features) for good models
 - **l0_norm**: Average number of active features per sample
+  - Should approximately equal `sparsity` when top-k is working correctly
+- **aux_loss**: Auxiliary loss value (only when `aux_loss_coeff > 0`)
+  - Penalizes features that are used less than `aux_loss_target`
+  - Helps reduce dead features during training
+
+All metrics are logged for both training (`train/*`) and validation (`val/*`) sets.
 
 ## Example: Training on Custom Data
 
 ```bash
-# Train on local JSONL file
+# Train on local JSONL file with auxiliary loss
 uv run -m EncoderSAE.main \
     --dataset="./data/my_texts.jsonl" \
     --model="bert-base-uncased" \
     --expansion_factor=32 \
     --sparsity=64 \
-    --epochs=1
+    --epochs=1 \
+    --aux_loss_coeff=1e-3 \
+    --aux_loss_target=0.01
 
-# Train on HuggingFace dataset
+# Train on HuggingFace dataset with multi-GPU
 uv run -m EncoderSAE.main \
     --dataset="wikitext" \
     --text_column="text" \
-    --model="roberta-base"
+    --model="roberta-base" \
+    --num_gpus=8 \
+    --use_vllm \
+    --val_step=500
 ```
+
+## Hyperparameter Sweeping
+
+A sweep script is included for systematic hyperparameter exploration:
+
+```bash
+bash run_sweep.sh
+```
+
+The script sweeps over:
+
+- **Expansion factors**: 32, 64, 128
+- **Sparsity ratios**: 0.5%, 1%, 2% of dictionary size
+- **Learning rates**: 1e-3, 5e-4, 2e-4, 1e-4
+- **Auxiliary loss coefficients**: 0.0, 1e-3, 5e-3, 1e-2
+- **Auxiliary loss targets**: 0.005, 0.01, 0.02
+
+Edit `run_sweep.sh` to customize the sweep ranges. Each run is automatically logged to WandB with a descriptive run name.
 
 ## Language Feature Analysis
 
@@ -187,38 +272,97 @@ uv run -m EncoderSAE.analyze_main \
 ```
 
 This will:
+
 - Load your trained SAE checkpoint
 - Process the validation set grouped by language
 - Identify which SAE features fire most frequently for each language
 - Save results to `./analysis/{checkpoint_name}/language_features.json`
 
 The output includes:
+
 - Top feature indices per language
 - Feature activation frequencies
 - Percentage of samples where each feature fires
 
 ## Project Structure
 
-```
+```text
 EncoderSAE/
 ├── EncoderSAE/
-│   ├── __init__.py      # Package exports
-│   ├── model.py         # SAE architecture
-│   ├── data.py          # Data loading & mean pooling
-│   ├── train.py         # Training loop
+│   ├── __init__.py      # Package exports & multiprocessing setup
+│   ├── model.py         # SAE architecture with auxiliary loss
+│   ├── data.py          # Data loading, activation extraction (vLLM/HF)
+│   ├── train.py         # Training loop with multi-GPU support
 │   ├── utils.py         # WandB setup & utilities
 │   ├── main.py          # CLI entry point (training)
 │   ├── analyze.py       # Language feature analysis
 │   └── analyze_main.py  # CLI entry point (analysis)
+├── run_main.py          # Wrapper script for multiprocessing compatibility
+├── run_sweep.sh         # Hyperparameter sweep script
 ├── pyproject.toml       # Package configuration (uv/pip)
+├── LICENSE              # MIT License
 └── README.md
 ```
 
-## Requirements
+## Performance Tips
 
-- Python >= 3.8
-- PyTorch >= 2.0.0
-- CUDA/MPS support (optional, for GPU acceleration)
+### Activation Extraction
+
+- **Use vLLM** (`--use_vllm=True`) for significantly faster embedding extraction, especially for large datasets
+- **Set `activation_batch_size`** larger than `batch_size` (e.g., 32768 vs 8192) to maximize throughput
+- **Multi-GPU extraction**: With `num_gpus > 1`, vLLM uses data-parallel processing (one engine per GPU)
+
+### Training
+
+- **Monitor `dead_features`**: Should decrease over training, target < 0.3
+- **Use `aux_loss_coeff`**: Helps reduce dead features, especially for large `expansion_factor` values
+- **Validation frequency**: Set `val_step=500` to catch overfitting early
+- **Multi-GPU training**: Automatically uses `DataParallel` when `num_gpus > 1`
+
+### Hyperparameter Guidelines
+
+- **Sparsity ratio**: Aim for 0.5% - 2% of dictionary size (`sparsity / dict_size`)
+- **Learning rate**: Start with `1e-3` or `5e-4`, adjust based on convergence
+- **Expansion factor**: Larger values (64, 128) may need stronger `aux_loss_coeff` to avoid dead features
+
+## Troubleshooting
+
+### vLLM Multiprocessing Error
+
+If you encounter `RuntimeError: Cannot re-initialize CUDA in forked subprocess`:
+
+**Solution**: Use the wrapper script or set environment variable:
+
+```bash
+# Option 1: Use wrapper script
+python run_main.py --model="..." --dataset="..."
+
+# Option 2: Set environment variable
+export PYTHON_MULTIPROCESSING_START_METHOD=spawn
+uv run -m EncoderSAE.main --model="..." --dataset="..."
+```
+
+### High Dead Features
+
+If `dead_features > 0.5`:
+
+- Increase `sparsity` (higher sparsity ratio)
+- Increase `aux_loss_coeff` (e.g., `1e-2`)
+- Decrease `expansion_factor` (smaller dictionary)
+- Train for more epochs
+
+### Overfitting
+
+If validation loss increases while training loss decreases:
+
+- Reduce learning rate
+- Increase `val_step` frequency to monitor earlier
+- Consider reducing `expansion_factor` or `sparsity`
+- Train for fewer epochs
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
