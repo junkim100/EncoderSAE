@@ -26,6 +26,8 @@ def train_sae(
     val_step: Optional[int] = 1000,
     save_dir: Optional[str] = None,
     checkpoint_steps: int = 1000,
+    aux_loss_coeff: float = 0.0,
+    aux_loss_target: float = 0.01,
 ) -> EncoderSAE:
     """
     Train the SAE model.
@@ -86,13 +88,15 @@ def train_sae(
             "l0_norm": [],
         }
 
-        with torch.no_grad():
-            for activations in val_loader:
-                activations = activations.to(device)
-                reconstructed, features, l0_norm = model(activations)
-                loss, metrics = unwrap(model).compute_loss(
-                    activations, reconstructed, features
-                )
+            with torch.no_grad():
+                for activations in val_loader:
+                    activations = activations.to(device)
+                    reconstructed, features, l0_norm, topk_mask = model(activations)
+                    loss, metrics = unwrap(model).compute_loss(
+                        activations, reconstructed, features, topk_mask,
+                        aux_loss_coeff=aux_loss_coeff,
+                        aux_loss_target=aux_loss_target,
+                    )
 
                 val_losses.append(metrics["loss"])
                 val_metrics["fvu"].append(metrics["fvu"])
@@ -144,11 +148,13 @@ def train_sae(
             activations = activations.to(device)
 
             # Forward pass
-            reconstructed, features, l0_norm = model(activations)
+            reconstructed, features, l0_norm, topk_mask = model(activations)
 
             # Compute loss (unwrap model if wrapped in DataParallel)
             loss, metrics = unwrap(model).compute_loss(
-                activations, reconstructed, features
+                activations, reconstructed, features, topk_mask,
+                aux_loss_coeff=aux_loss_coeff,
+                aux_loss_target=aux_loss_target,
             )
 
             # Scale loss for gradient accumulation

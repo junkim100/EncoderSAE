@@ -51,6 +51,8 @@ def main(
     log_steps: int = 10,
     checkpoint_steps: int = 1000,
     val_step: Optional[int] = 1000,
+    aux_loss_coeff: float = 1e-3,
+    aux_loss_target: float = 0.01,
     val_set: Optional[str] = None,
     val_dataset: Optional[str] = None,
     val_split: float = 0.05,
@@ -84,6 +86,10 @@ def main(
         log_steps: Log metrics every N steps (default: 10)
         checkpoint_steps: Save checkpoints every N training steps (default: 1000)
         val_step: Run validation every N training steps (default: 1000). Set to None or <=0 for end-of-epoch only.
+        aux_loss_coeff: Coefficient for auxiliary loss that encourages feature usage (default: 1e-3).
+            Set to 0.0 to disable. Higher values more aggressively reduce dead features.
+        aux_loss_target: Target fraction of samples where each feature should appear in top-k (default: 0.01).
+            Features used less than this fraction are penalized.
         val_set: Path to validation activations directory (if precomputed). Ignored if
             val_dataset is provided. If both are None, auto-split from train.
         val_dataset: HuggingFace dataset ID or local JSON/JSONL file for validation.
@@ -274,7 +280,14 @@ def main(
 
     # Determine save directory (always set, but overridable)
     if save_dir is None:
-        save_dir = f"./checkpoints/{model_short}_{dataset_short}"
+        # Create parent directory: checkpoints/{model_short}_{dataset_short}
+        parent_dir = f"./checkpoints/{model_short}_{dataset_short}"
+        # Create hyperparameter subfolder: exp{expansion_factor}_k{sparsity}_lr{lr_tag}
+        # Format lr to match sweep script (printf "%g" style)
+        # This gives clean formatting: 0.001, 0.0005, 0.0001, etc.
+        lr_tag = f"{lr:g}".rstrip("0").rstrip(".")
+        hyperparam_subdir = f"exp{expansion_factor}_k{sparsity}_lr{lr_tag}"
+        save_dir = f"{parent_dir}/{hyperparam_subdir}"
 
     # Create data loaders
     train_loader = DataLoader(
@@ -338,6 +351,8 @@ def main(
         save_dir=save_dir,
         checkpoint_steps=checkpoint_steps,
         val_step=val_step,
+        aux_loss_coeff=aux_loss_coeff,
+        aux_loss_target=aux_loss_target,
     )
 
     # Save final model

@@ -42,7 +42,7 @@ class EncoderSAE(nn.Module):
 
     def forward(
         self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass through the SAE.
 
@@ -50,10 +50,11 @@ class EncoderSAE(nn.Module):
             x: Input activations of shape (batch_size, input_dim)
 
         Returns:
-            tuple of (reconstructed, features, l0_norm):
+            tuple of (reconstructed, features, l0_norm, topk_mask):
             - reconstructed: Reconstructed input (batch_size, input_dim)
             - features: Sparse feature activations (batch_size, dict_size)
             - l0_norm: Average number of active features per sample
+            - topk_mask: Binary mask (batch_size, dict_size) indicating which features were in top-k
         """
         # Encode: project to dictionary space
         features = self.encoder(x)  # (batch_size, dict_size)
@@ -62,11 +63,22 @@ class EncoderSAE(nn.Module):
         features = F.relu(features)
 
         # TopK sparsity: keep only top-k features per sample
+        topk_mask = None
         if self.sparsity > 0 and self.sparsity < self.dict_size:
             topk_values, topk_indices = torch.topk(features, k=self.sparsity, dim=1)
             sparse_features = torch.zeros_like(features)
             sparse_features.scatter_(1, topk_indices, topk_values)
+
+            # Create binary mask indicating which features were selected in top-k
+            topk_mask = torch.zeros_like(features, dtype=torch.bool)
+            topk_mask.scatter_(
+                1, topk_indices, torch.ones_like(topk_indices, dtype=torch.bool)
+            )
+
             features = sparse_features
+        else:
+            # If no top-k, all non-zero features are "selected"
+            topk_mask = features > 0
 
         # Decode: reconstruct input
         reconstructed = self.decoder(features)
@@ -74,14 +86,17 @@ class EncoderSAE(nn.Module):
         # Compute L0 norm (number of active features)
         l0_norm = (features > 0).float().sum(dim=1).mean()
 
-        return reconstructed, features, l0_norm
+        return reconstructed, features, l0_norm, topk_mask
 
     def compute_loss(
         self,
         x: torch.Tensor,
         reconstructed: torch.Tensor,
         features: torch.Tensor,
+        topk_mask: torch.Tensor,
         l1_coeff: float = 0.0,
+        aux_loss_coeff: float = 0.0,
+        aux_loss_target: float = 0.01,
     ) -> tuple[torch.Tensor, dict]:
         """
         Compute reconstruction loss and auxiliary metrics.
@@ -90,12 +105,15 @@ class EncoderSAE(nn.Module):
             x: Original input (batch_size, input_dim)
             reconstructed: Reconstructed input (batch_size, input_dim)
             features: Sparse features (batch_size, dict_size)
+            topk_mask: Binary mask (batch_size, dict_size) indicating which features were in top-k
             l1_coeff: L1 regularization coefficient (default: 0.0, not used in top-k)
+            aux_loss_coeff: Coefficient for auxiliary loss that encourages feature usage (default: 0.0)
+            aux_loss_target: Target fraction of samples where each feature should appear in top-k (default: 0.01)
 
         Returns:
             tuple of (loss, metrics_dict):
-            - loss: Total loss (MSE reconstruction loss)
-            - metrics_dict: Dictionary with fvu, dead_feature_pct, etc.
+            - loss: Total loss (MSE + L1 + auxiliary loss)
+            - metrics_dict: Dictionary with fvu, dead_features, etc.
         """
         # Reconstruction loss (MSE)
         mse_loss = F.mse_loss(reconstructed, x, reduction="mean")
@@ -103,7 +121,24 @@ class EncoderSAE(nn.Module):
         # L1 regularization (optional, typically not used with top-k)
         l1_loss = features.abs().mean() * l1_coeff
 
-        total_loss = mse_loss + l1_loss
+        # Auxiliary loss: encourage features to appear in top-k at least occasionally
+        # Compute fraction of samples where each feature appears in top-k
+        # topk_mask shape: (batch_size, dict_size)
+        feature_usage = topk_mask.float().mean(
+            dim=0
+        )  # (dict_size,) - fraction per feature
+
+        # Penalize features that are used less than target threshold
+        # This encourages dead features to start firing
+        if aux_loss_coeff > 0:
+            # Loss = mean over features of max(0, target - usage)^2
+            # This penalizes features with usage < target
+            usage_deficit = torch.clamp(aux_loss_target - feature_usage, min=0.0)
+            aux_loss = (usage_deficit.pow(2).mean()) * aux_loss_coeff
+        else:
+            aux_loss = torch.tensor(0.0, device=x.device)
+
+        total_loss = mse_loss + l1_loss + aux_loss
 
         # Compute metrics
         # FVU: Fraction of Variance Unexplained
@@ -120,6 +155,7 @@ class EncoderSAE(nn.Module):
             "fvu": fvu.item(),
             "dead_features": dead_features.item(),
             "l1_loss": l1_loss.item() if l1_coeff > 0 else 0.0,
+            "aux_loss": aux_loss.item() if aux_loss_coeff > 0 else 0.0,
         }
 
         return total_loss, metrics
