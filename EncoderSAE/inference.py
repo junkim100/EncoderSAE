@@ -262,7 +262,7 @@ def infer_language_agnostic(
 
     # Pass through SAE to get features
     with torch.no_grad():
-        _, features, _, _ = sae(base_embeddings)
+        _, features, _, _, _ = sae(base_embeddings)
 
     # Remove language-specific features
     features_agnostic = remove_language_features(features, mask)
@@ -558,6 +558,9 @@ class LanguageAgnosticEncoder:
 
                 # Remove language-specific features using the already-loaded mask
                 features_agnostic = remove_language_features(features, self.mask)
-                all_features.append(features_agnostic)
 
+                # Move to CPU immediately to avoid GPU OOM when concatenating
+                all_features.append(features_agnostic.cpu())
+
+        # Concatenate on CPU to avoid GPU memory issues
         return torch.cat(all_features, dim=0)

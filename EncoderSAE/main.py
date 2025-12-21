@@ -24,17 +24,81 @@ except RuntimeError:
         )
 
 from pathlib import Path
+import math
 from typing import Optional
 
 import fire
 import torch
-from torch.utils.data import DataLoader, random_split
+import torch.distributed as dist
+from torch.utils.data import DataLoader, RandomSampler, random_split
+from torch.utils.data.distributed import DistributedSampler
 
 from .model import EncoderSAE
 from .data import ActivationDataset, load_data, extract_activations
 from .train import train_sae
 from .utils import set_seed, setup_wandb, get_device
 import wandb
+
+
+def _activation_collate(batch):
+    """
+    Collate function for activation datasets.
+
+    - If the dataset implements a fast-path `__getitems__` and returns an
+      already-batched Tensor, return it as-is.
+    - Otherwise, stack a list/tuple of per-sample tensors.
+    """
+    if isinstance(batch, torch.Tensor):
+        return batch
+    return torch.stack(batch, dim=0)
+
+
+class _DistributedReplacementSampler(torch.utils.data.Sampler[int]):
+    """
+    Distributed sampler that samples with replacement (uses randint) so it does
+    not materialize a full permutation for very large datasets.
+    """
+
+    def __init__(
+        self,
+        dataset,
+        num_replicas: int,
+        rank: int,
+        seed: int = 0,
+        num_samples: Optional[int] = None,
+    ):
+        self.dataset = dataset
+        self.dataset_size = len(dataset)
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.seed = seed
+        self.epoch = 0
+
+        # Target number of samples per "epoch" (global). Default: one pass over dataset.
+        self.num_samples = (
+            int(num_samples) if num_samples is not None else self.dataset_size
+        )
+        self.num_samples_per_replica = int(
+            math.ceil(self.num_samples / self.num_replicas)
+        )
+
+    def __iter__(self):
+        g = torch.Generator()
+        # Ensure each rank draws a different stream, and reshuffle each epoch.
+        g.manual_seed(self.seed + self.epoch * 10_000 + self.rank)
+        indices = torch.randint(
+            high=self.dataset_size,
+            size=(self.num_samples_per_replica,),
+            generator=g,
+            dtype=torch.int64,
+        ).tolist()
+        return iter(indices)
+
+    def __len__(self) -> int:
+        return self.num_samples_per_replica
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
 
 
 def main(
@@ -44,6 +108,7 @@ def main(
     expansion_factor: int = 32,
     sparsity: int = 64,
     batch_size: int = 32,
+    val_batch_size: Optional[int] = None,
     activation_batch_size: Optional[int] = None,
     grad_acc_steps: int = 1,
     epochs: int = 1,
@@ -113,9 +178,37 @@ def main(
     # Set seed
     set_seed(seed)
 
-    # Get device
-    device = get_device()
-    print(f"Using device: {device}")
+    # --------------------
+    # Distributed (DDP) setup
+    # --------------------
+    ddp_local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
+    is_distributed = ddp_local_rank != -1
+    rank = 0
+    world_size = 1
+
+    if is_distributed:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        if torch.cuda.is_available():
+            torch.cuda.set_device(ddp_local_rank)
+            device = torch.device("cuda", ddp_local_rank)
+        else:
+            device = torch.device("cpu")
+
+        if not dist.is_initialized():
+            dist.init_process_group(backend=backend, init_method="env://")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    else:
+        # Non-DDP path (single process; may still use DataParallel in train.py)
+        device = get_device()
+
+    is_main_process = rank == 0
+    if is_main_process:
+        print(f"Using device: {device}")
+        if is_distributed:
+            print(
+                f"DDP initialized: rank {rank}/{world_size}, local_rank={ddp_local_rank}, backend={dist.get_backend()}"
+            )
 
     # Determine model/dataset short names
     model_short = Path(model).stem if os.path.exists(model) else model.replace("/", "_")
@@ -139,45 +232,69 @@ def main(
 
     # Check if activations already exist
     if save_activations and activations_file.exists():
-        print(f"Loading cached activations from {activations_file}")
+        if is_main_process:
+            print(f"Loading cached activations from {activations_file}")
         train_dataset = ActivationDataset(str(activations_file))
     else:
-        # Load data
-        print(f"Loading dataset: {dataset}")
-        texts = load_data(dataset, text_column=text_column, max_samples=max_samples)
-        print(f"Loaded {len(texts)} samples")
-
-        # Extract activations
-        if save_activations:
-            print("Extracting activations...")
-            # For vLLM multi-GPU, pass dataset path for on-demand loading
-            # For other paths, pass texts (already loaded)
-            dataset_path_for_extraction = (
-                dataset
-                if (use_vllm and num_gpus and num_gpus > 1 and os.path.exists(dataset))
-                else None
-            )
-            activations_file = Path(
-                extract_activations(
-                    model_name=model,
-                    texts=texts,
-                    output_dir=str(activations_dir_path),
-                    batch_size=activation_bs,
-                    max_length=max_length,
-                    device=device,
-                    num_gpus=num_gpus,
-                    use_vllm=use_vllm,
-                    gpu_memory_utilization=gpu_memory_utilization,
-                    dataset_path=dataset_path_for_extraction,
-                    text_column=text_column,
-                )
-            )
+        # In DDP mode, avoid multiple ranks trying to extract and write the same cache.
+        if is_distributed and not is_main_process:
+            if is_main_process:
+                # (unreachable) keep for clarity
+                pass
+            # Wait for rank 0 to extract/write the cache.
+            dist.barrier()
             train_dataset = ActivationDataset(str(activations_file))
         else:
-            # Extract on-the-fly (not recommended for large datasets)
-            raise NotImplementedError(
-                "On-the-fly activation extraction not implemented. Use save_activations=True."
-            )
+            # Load data
+            if is_main_process:
+                print(f"Loading dataset: {dataset}")
+            texts = load_data(dataset, text_column=text_column, max_samples=max_samples)
+            if is_main_process:
+                print(f"Loaded {len(texts)} samples")
+
+            # Extract activations
+            if save_activations:
+                if is_main_process:
+                    print("Extracting activations...")
+                # For vLLM multi-GPU, pass dataset path for on-demand loading
+                # For other paths, pass texts (already loaded)
+                dataset_path_for_extraction = (
+                    dataset
+                    if (
+                        use_vllm
+                        and num_gpus
+                        and num_gpus > 1
+                        and os.path.exists(dataset)
+                    )
+                    else None
+                )
+                # If we're already running under torchrun, do NOT fan out across all GPUs again.
+                extraction_num_gpus = 1 if is_distributed else num_gpus
+                activations_file = Path(
+                    extract_activations(
+                        model_name=model,
+                        texts=texts,
+                        output_dir=str(activations_dir_path),
+                        batch_size=activation_bs,
+                        max_length=max_length,
+                        device=device,
+                        num_gpus=extraction_num_gpus,
+                        use_vllm=use_vllm,
+                        gpu_memory_utilization=gpu_memory_utilization,
+                        dataset_path=dataset_path_for_extraction,
+                        text_column=text_column,
+                    )
+                )
+                train_dataset = ActivationDataset(str(activations_file))
+            else:
+                # Extract on-the-fly (not recommended for large datasets)
+                raise NotImplementedError(
+                    "On-the-fly activation extraction not implemented. Use save_activations=True."
+                )
+
+            # Let other ranks proceed to load the now-written cache.
+            if is_distributed:
+                dist.barrier()
 
     # Prepare validation dataset (optional separate dataset)
     val_dataset_obj = None
@@ -198,49 +315,64 @@ def main(
         val_activations_file = val_activations_dir_path / f"{val_model_short}.pt"
 
         if save_activations and val_activations_file.exists():
-            print(f"Loading cached validation activations from {val_activations_file}")
+            if is_main_process:
+                print(
+                    f"Loading cached validation activations from {val_activations_file}"
+                )
             val_dataset_obj = ActivationDataset(str(val_activations_file))
         else:
-            print(f"Loading validation dataset: {val_dataset}")
-            val_texts = load_data(
-                val_dataset, text_column=text_column, max_samples=max_samples
-            )
-            print(f"Loaded {len(val_texts)} validation samples")
-
-            if save_activations:
-                print("Extracting validation activations...")
-                # For vLLM multi-GPU, pass dataset path for on-demand loading
-                val_dataset_path_for_extraction = (
-                    val_dataset
-                    if (
-                        use_vllm
-                        and num_gpus
-                        and num_gpus > 1
-                        and os.path.exists(val_dataset)
-                    )
-                    else None
-                )
-                val_activations_file = Path(
-                    extract_activations(
-                        model_name=model,
-                        texts=val_texts,
-                        output_dir=str(val_activations_dir_path),
-                        batch_size=activation_bs,
-                        max_length=max_length,
-                        device=device,
-                        num_gpus=num_gpus,
-                        use_vllm=use_vllm,
-                        gpu_memory_utilization=gpu_memory_utilization,
-                        dataset_path=val_dataset_path_for_extraction,
-                        text_column=text_column,
-                    )
-                )
+            # In DDP mode, avoid multiple ranks extracting the same validation cache.
+            if is_distributed and not is_main_process:
+                dist.barrier()
                 val_dataset_obj = ActivationDataset(str(val_activations_file))
             else:
-                raise NotImplementedError(
-                    "On-the-fly validation activation extraction not implemented. "
-                    "Use save_activations=True."
+                if is_main_process:
+                    print(f"Loading validation dataset: {val_dataset}")
+                val_texts = load_data(
+                    val_dataset, text_column=text_column, max_samples=max_samples
                 )
+                if is_main_process:
+                    print(f"Loaded {len(val_texts)} validation samples")
+
+                if save_activations:
+                    if is_main_process:
+                        print("Extracting validation activations...")
+                    # For vLLM multi-GPU, pass dataset path for on-demand loading
+                    val_dataset_path_for_extraction = (
+                        val_dataset
+                        if (
+                            use_vllm
+                            and num_gpus
+                            and num_gpus > 1
+                            and os.path.exists(val_dataset)
+                        )
+                        else None
+                    )
+                    extraction_num_gpus = 1 if is_distributed else num_gpus
+                    val_activations_file = Path(
+                        extract_activations(
+                            model_name=model,
+                            texts=val_texts,
+                            output_dir=str(val_activations_dir_path),
+                            batch_size=activation_bs,
+                            max_length=max_length,
+                            device=device,
+                            num_gpus=extraction_num_gpus,
+                            use_vllm=use_vllm,
+                            gpu_memory_utilization=gpu_memory_utilization,
+                            dataset_path=val_dataset_path_for_extraction,
+                            text_column=text_column,
+                        )
+                    )
+                    val_dataset_obj = ActivationDataset(str(val_activations_file))
+                else:
+                    raise NotImplementedError(
+                        "On-the-fly validation activation extraction not implemented. "
+                        "Use save_activations=True."
+                    )
+
+                if is_distributed:
+                    dist.barrier()
 
     # Split train/val
     if val_dataset_obj is not None:
@@ -275,9 +407,10 @@ def main(
             val_path = pt_files[0]
 
         val_dataset = ActivationDataset(str(val_path))
-        print(
-            f"Using separate validation set from {val_path}: {len(val_dataset)} samples"
-        )
+        if is_main_process:
+            print(
+                f"Using separate validation set from {val_path}: {len(val_dataset)} samples"
+            )
 
     # Determine save directory (always set, but overridable)
     if save_dir is None:
@@ -330,25 +463,127 @@ def main(
         hyperparam_subdir = f"exp{expansion_factor}_k{sparsity}_lr{lr_tag}_{aux_tag}"
         save_dir = f"{parent_dir}/{hyperparam_subdir}"
 
-    # Create data loaders
+    # Create data loaders with multiprocessing for faster data loading
+    # Use 4-8 workers depending on system, with pin_memory for faster GPU transfer
+    num_workers = (
+        min(8, max(4, torch.get_num_threads() // 2)) if device.type == "cuda" else 0
+    )
+    # Avoid exploding worker count under DDP (workers per process * world_size).
+    if is_distributed and num_workers > 0:
+        num_workers = max(1, num_workers // world_size)
+
+    # NOTE: For very large datasets, `shuffle=True` triggers
+    # `torch.randperm(n).tolist()` internally, which can be extremely slow and
+    # memory-heavy for tens of millions of samples. In that case, fall back to
+    # sampling *with replacement* to avoid materializing a full permutation.
+    train_shuffle = True
+    train_sampler = None
+    try:
+        n_train = len(train_dataset)
+    except Exception:
+        n_train = None
+
+    # In DDP, interpret `batch_size` as the GLOBAL batch size (like DataParallel).
+    global_batch_size = batch_size
+    global_val_batch_size = val_batch_size
+    if is_distributed:
+        if global_batch_size % world_size != 0:
+            raise ValueError(
+                f"In DDP, --batch_size is interpreted as the GLOBAL batch size. "
+                f"Got batch_size={global_batch_size} which is not divisible by world_size={world_size}."
+            )
+        batch_size = global_batch_size // world_size
+
+    if is_distributed:
+        if n_train is not None and n_train >= 5_000_000:
+            if is_main_process:
+                print(
+                    f"Train dataset is very large ({n_train:,} samples). "
+                    "Using distributed replacement sampling to avoid huge shuffle permutations."
+                )
+            train_sampler = _DistributedReplacementSampler(
+                train_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                seed=seed,
+                num_samples=n_train,
+            )
+            train_shuffle = False
+        else:
+            train_sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+                seed=seed,
+                drop_last=False,
+            )
+            train_shuffle = False
+    else:
+        if n_train is not None and n_train >= 5_000_000:
+            print(
+                f"Train dataset is very large ({n_train:,} samples). "
+                "Using RandomSampler(replacement=True) to avoid huge shuffle permutations."
+            )
+            g = torch.Generator().manual_seed(seed)
+            train_sampler = RandomSampler(
+                train_dataset, replacement=True, num_samples=n_train, generator=g
+            )
+            train_shuffle = False
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,  # Set to 0 to avoid issues with .pt files
+        shuffle=train_shuffle,
+        sampler=train_sampler,
+        num_workers=num_workers,
+        collate_fn=_activation_collate,
+        pin_memory=(device.type == "cuda"),  # Faster GPU transfer
+        persistent_workers=(num_workers > 0),  # Keep workers alive between epochs
     )
+
+    # Use a smaller batch size for validation.
+    # In DDP, this is also interpreted as GLOBAL and divided across ranks.
+    effective_global_val_bs = global_val_batch_size or min(global_batch_size, 32768)
+    if is_distributed:
+        if effective_global_val_bs % world_size != 0:
+            raise ValueError(
+                f"In DDP, --val_batch_size (or its default) is interpreted as the GLOBAL batch size. "
+                f"Got val_batch_size={effective_global_val_bs} which is not divisible by world_size={world_size}."
+            )
+        actual_val_batch_size = effective_global_val_bs // world_size
+    else:
+        actual_val_batch_size = effective_global_val_bs
+
+    if is_main_process and actual_val_batch_size < batch_size:
+        print(f"Using smaller validation batch size: {actual_val_batch_size}")
+
+    val_sampler = None
+    if is_distributed:
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+            drop_last=False,
+        )
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=batch_size,
+        batch_size=actual_val_batch_size,
         shuffle=False,
-        num_workers=0,
+        sampler=val_sampler,
+        num_workers=num_workers,
+        collate_fn=_activation_collate,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(num_workers > 0),
     )
 
     # Get input dimension from first sample
     sample_activation = train_dataset[0]
     input_dim = sample_activation.shape[0]
-    print(f"Input dimension: {input_dim}")
+    if is_main_process:
+        print(f"Input dimension: {input_dim}")
 
     # Initialize model
     sae = EncoderSAE(
@@ -356,31 +591,37 @@ def main(
         expansion_factor=expansion_factor,
         sparsity=sparsity,
     )
-    print(f"SAE initialized: dict_size={sae.dict_size}, sparsity={sparsity}")
+    if is_main_process:
+        print(f"SAE initialized: dict_size={sae.dict_size}, sparsity={sparsity}")
 
     # Setup WandB
-    run = setup_wandb(
-        project=wandb_project,
-        run_name=wandb_run_name,
-        model_name=model,
-        dataset_name=dataset,
-        expansion_factor=expansion_factor,
-        sparsity=sparsity,
-        batch_size=batch_size,
-        config={
-            "input_dim": input_dim,
-            "dict_size": sae.dict_size,
-            "epochs": epochs,
-            "lr": lr,
-            "grad_acc_steps": grad_acc_steps,
-            "seed": seed,
-            "aux_loss_coeff": aux_loss_coeff,
-            "aux_loss_target": aux_loss_target,
-        },
-    )
+    if is_main_process:
+        run = setup_wandb(
+            project=wandb_project,
+            run_name=wandb_run_name,
+            model_name=model,
+            dataset_name=dataset,
+            expansion_factor=expansion_factor,
+            sparsity=sparsity,
+            batch_size=global_batch_size if is_distributed else batch_size,
+            config={
+                "input_dim": input_dim,
+                "dict_size": sae.dict_size,
+                "epochs": epochs,
+                "lr": lr,
+                "grad_acc_steps": grad_acc_steps,
+                "seed": seed,
+                "aux_loss_coeff": aux_loss_coeff,
+                "aux_loss_target": aux_loss_target,
+                "ddp": is_distributed,
+                "world_size": world_size,
+                "per_rank_batch_size": batch_size,
+            },
+        )
 
     # Train
-    print("Starting training...")
+    if is_main_process:
+        print("Starting training...")
     trained_model = train_sae(
         model=sae,
         train_loader=train_loader,
@@ -399,14 +640,20 @@ def main(
     )
 
     # Save final model
-    if save_dir:
+    if is_main_process and save_dir:
         final_path = Path(save_dir) / "final_model.pt"
         final_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(trained_model.state_dict(), final_path)
         print(f"Saved final model to {final_path}")
 
-    wandb.finish()
-    print("Training complete!")
+    if is_main_process:
+        wandb.finish()
+        print("Training complete!")
+
+    if is_distributed:
+        # Ensure all ranks finish cleanly.
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

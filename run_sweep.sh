@@ -6,20 +6,20 @@ set -euo pipefail
 MODEL="intfloat/multilingual-e5-large"
 DATASET="data/4lang_train.jsonl"
 VAL_DATASET="data/4lang_validation.jsonl"
-VAL_STEP=100
-BATCH_SIZE=32768
+VAL_STEP=50
+BATCH_SIZE=294912
 GRAD_ACC_STEPS=1
-LOG_STEPS=10
-CHECKPOINT_STEPS=100
-NUM_GPUS=8
+LOG_STEPS=5
+CHECKPOINT_STEPS=50
+NUM_GPUS=2
 GPU_MEM_UTIL=0.95
 
 INPUT_DIM=1024
 
 EXPANSION_FACTORS=(32 64 128)
-SPARSITY_RATIOS=(0.01)
+SPARSITY_RATIOS=(0.01 0.025 0.05)
 LRS=(5e-4 1e-3)
-AUX_LOSS_COEFFS=(0.0 1e-2)
+AUX_LOSS_COEFFS=(0.0 1e-3 1e-2)
 AUX_LOSS_TARGETS=(0.01 0.02)
 
 for ef in "${EXPANSION_FACTORS[@]}"; do
@@ -98,24 +98,45 @@ EOF
           echo "  Run name: ${run_name}"
           echo "==============================================="
 
-          uv run -m EncoderSAE.main \
-            --model="${MODEL}" \
-            --dataset="${DATASET}" \
-            --val_dataset="${VAL_DATASET}" \
-            --val_step="${VAL_STEP}" \
-            --expansion_factor="${ef}" \
-            --sparsity="${k}" \
-            --batch_size="${BATCH_SIZE}" \
-            --grad_acc_steps="${GRAD_ACC_STEPS}" \
-            --lr="${lr}" \
-            --log_steps="${LOG_STEPS}" \
-            --checkpoint_steps="${CHECKPOINT_STEPS}" \
-            --num_gpus="${NUM_GPUS}" \
-            --use_vllm=True \
-            --gpu_memory_utilization="${GPU_MEM_UTIL}" \
-            --aux_loss_coeff="${aux_coeff}" \
-            --aux_loss_target="${aux_target}" \
-            --wandb_run_name="${run_name}"
+          if [ "${NUM_GPUS}" -gt 1 ]; then
+            uv run torchrun --standalone --nproc_per_node="${NUM_GPUS}" -m EncoderSAE.main \
+              --model="${MODEL}" \
+              --dataset="${DATASET}" \
+              --val_dataset="${VAL_DATASET}" \
+              --val_step="${VAL_STEP}" \
+              --expansion_factor="${ef}" \
+              --sparsity="${k}" \
+              --batch_size="${BATCH_SIZE}" \
+              --grad_acc_steps="${GRAD_ACC_STEPS}" \
+              --lr="${lr}" \
+              --log_steps="${LOG_STEPS}" \
+              --checkpoint_steps="${CHECKPOINT_STEPS}" \
+              --num_gpus="${NUM_GPUS}" \
+              --use_vllm=True \
+              --gpu_memory_utilization="${GPU_MEM_UTIL}" \
+              --aux_loss_coeff="${aux_coeff}" \
+              --aux_loss_target="${aux_target}" \
+              --wandb_run_name="${run_name}"
+          else
+            uv run -m EncoderSAE.main \
+              --model="${MODEL}" \
+              --dataset="${DATASET}" \
+              --val_dataset="${VAL_DATASET}" \
+              --val_step="${VAL_STEP}" \
+              --expansion_factor="${ef}" \
+              --sparsity="${k}" \
+              --batch_size="${BATCH_SIZE}" \
+              --grad_acc_steps="${GRAD_ACC_STEPS}" \
+              --lr="${lr}" \
+              --log_steps="${LOG_STEPS}" \
+              --checkpoint_steps="${CHECKPOINT_STEPS}" \
+              --num_gpus="${NUM_GPUS}" \
+              --use_vllm=True \
+              --gpu_memory_utilization="${GPU_MEM_UTIL}" \
+              --aux_loss_coeff="${aux_coeff}" \
+              --aux_loss_target="${aux_target}" \
+              --wandb_run_name="${run_name}"
+          fi
 
           echo "Finished run: ${run_name}"
           echo

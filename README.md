@@ -47,6 +47,18 @@ Train with default settings:
 uv run -m EncoderSAE.main
 ```
 
+### Multi-GPU training (recommended: DDP)
+
+For balanced GPU memory usage and better scaling, launch with `torchrun` (DDP):
+
+```bash
+uv run torchrun --standalone --nproc_per_node=2 -m EncoderSAE.main --num_gpus=2
+```
+
+Notes:
+- `batch_size` is treated as the **GLOBAL** batch size in DDP (it is divided by `world_size` per rank).
+- Only rank 0 logs to WandB; metrics are reduced across ranks before logging.
+
 This will:
 
 - Use model: `intfloat/multilingual-e5-large`
@@ -126,6 +138,7 @@ The model is initialized with tied weights (decoder = encoder^T).
 
 - `save_activations`: Cache activations to disk (default: `True`)
 - `activations_dir`: Directory for cached activations (auto-generated as `./activations/{model}_{dataset}` if `None`)
+- **Large activation caches**: Cached activation `.pt` files can be very large (100GB+). Loading uses `torch.load(..., mmap=True)` when available so startup is fast and does **not** require reading the entire file into RAM.
 - `val_set`: Path to validation activations directory (if precomputed). Ignored if `val_dataset` is provided; if both are `None`, 5% of train is auto-split for validation.
 - `val_dataset`: HuggingFace dataset ID or local JSON/JSONL file for validation; if provided, a separate validation activation set is extracted and `val_split` is ignored.
 - `val_split`: Fraction for validation split when `val_dataset` and `val_set` are `None` (default: `0.05`)
@@ -140,12 +153,14 @@ The model is initialized with tied weights (decoder = encoder^T).
     - HF path (`use_vllm=False`): controls how many GPUs are used in the custom multi-process data-parallel extraction.
     - vLLM path (`use_vllm=True`): passed as `tensor_parallel_size` to `vllm.LLM` (tensor parallelism).
   - **SAE training**:
-    - If CUDA is available and more than 1 GPU is visible, the training loop uses `torch.nn.DataParallel` with:
-      - `num_gpus=None`: all visible GPUs
-      - `num_gpus=1`: single-GPU training
-      - `num_gpus>1`: that many GPUs (capped by `torch.cuda.device_count()`).
+    - **Recommended**: use `torchrun ... -m EncoderSAE.main` to enable `DistributedDataParallel` (DDP).
+    - If you run without `torchrun` and multiple GPUs are visible, the code falls back to `torch.nn.DataParallel`.
 - `use_vllm`: Use vLLM for faster activation extraction with `task="embed"` (default: `False`).
 - `gpu_memory_utilization`: GPU memory utilization for vLLM, 0.0-1.0 (default: `0.9`)
+
+### Note on shuffling very large datasets
+
+For extremely large activation datasets (millions of samples), PyTorch's default `shuffle=True` can be slow/memory-heavy because it materializes a full random permutation. EncoderSAE automatically switches to sampling **with replacement** in that case to keep startup and epochs practical.
 
 ### Troubleshooting: vLLM Multiprocessing Error
 

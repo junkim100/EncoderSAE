@@ -48,6 +48,9 @@ class ActivationDataset(Dataset):
             activations_path: Path to a single .pt file containing all activations
         """
         activations_path = Path(activations_path)
+        self.activations_path = activations_path
+        self.activations: Optional[torch.Tensor] = None
+        self._length: Optional[int] = None
 
         # Require a single combined .pt file
         if not (activations_path.is_file() and activations_path.suffix == ".pt"):
@@ -55,9 +58,39 @@ class ActivationDataset(Dataset):
                 f"activations_path must be a .pt file containing all activations, got {activations_path}"
             )
 
+        # Preserve previous behavior: load immediately on construction.
+        self._load()
+
+    def _load(self) -> None:
+        """Load (or mmap) activations into this process if not already loaded."""
+        if self.activations is not None:
+            return
+
         # Load combined file format: tensor of shape (num_samples, activation_dim)
-        print(f"Loading activations from {activations_path} ...")
-        activations = torch.load(activations_path)
+        #
+        # IMPORTANT: activation caches can be extremely large (100GB+). A plain
+        # torch.load() will fully deserialize into RAM and can appear "stuck"
+        # for a long time. Newer PyTorch supports mmap=True to memory-map the
+        # underlying storage for near-instant load and much lower memory usage.
+        import time
+
+        try:
+            size_gb = self.activations_path.stat().st_size / (1024**3)
+            size_str = f"{size_gb:.1f}GB"
+        except Exception:
+            size_str = "unknown size"
+
+        print(f"Loading activations from {self.activations_path} ({size_str}) ...")
+        t0 = time.time()
+        try:
+            activations = torch.load(
+                self.activations_path, map_location="cpu", mmap=True
+            )
+        except TypeError:
+            # Older PyTorch versions may not support mmap.
+            activations = torch.load(self.activations_path, map_location="cpu")
+        dt = time.time() - t0
+        print(f"Loaded activations in {dt:.2f}s", flush=True)
 
         # Common case: already a single tensor
         if isinstance(activations, torch.Tensor):
@@ -96,16 +129,42 @@ class ActivationDataset(Dataset):
                     )
                 else:
                     raise ValueError(
-                        f"Unexpected 'activations' field format in {activations_path}"
+                        f"Unexpected 'activations' field format in {self.activations_path}"
                     )
             else:
-                raise ValueError(f"Unexpected format in {activations_path}")
+                raise ValueError(f"Unexpected format in {self.activations_path}")
+
+        if not isinstance(self.activations, torch.Tensor):
+            raise ValueError(
+                f"Activations did not resolve to a torch.Tensor for {self.activations_path}"
+            )
+        self._length = int(self.activations.shape[0])
+
+    def __getstate__(self):
+        """
+        Avoid pickling a huge Tensor when DataLoader uses multiprocessing (spawn).
+        Each worker process can cheaply mmap the same file on first access.
+        """
+        state = dict(self.__dict__)
+        state["activations"] = None
+        state["_length"] = None
+        return state
 
     def __len__(self):
-        return self.activations.shape[0]
+        if self._length is None:
+            self._load()
+        return self._length
 
     def __getitem__(self, idx):
+        if self.activations is None:
+            self._load()
         return self.activations[idx]
+
+    # Optional fast-path: DataLoader can call this with a list of indices.
+    def __getitems__(self, indices):
+        if self.activations is None:
+            self._load()
+        return self.activations[indices]
 
 
 def load_data(
