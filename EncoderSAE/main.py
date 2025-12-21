@@ -88,8 +88,9 @@ def main(
         val_step: Run validation every N training steps (default: 1000). Set to None or <=0 for end-of-epoch only.
         aux_loss_coeff: Coefficient for auxiliary loss that encourages feature usage (default: 1e-3).
             Set to 0.0 to disable. Higher values more aggressively reduce dead features.
-        aux_loss_target: Target fraction of samples where each feature should appear in top-k (default: 0.01).
-            Features used less than this fraction are penalized.
+        aux_loss_target: Target fraction of samples where each feature should activate (default: 0.01).
+            This is a fraction between 0 and 1 (e.g., 0.01 = 1% of samples).
+            Features that activate in fewer samples than this target are penalized.
         val_set: Path to validation activations directory (if precomputed). Ignored if
             val_dataset is provided. If both are None, auto-split from train.
         val_dataset: HuggingFace dataset ID or local JSON/JSONL file for validation.
@@ -282,11 +283,51 @@ def main(
     if save_dir is None:
         # Create parent directory: checkpoints/{model_short}_{dataset_short}
         parent_dir = f"./checkpoints/{model_short}_{dataset_short}"
-        # Create hyperparameter subfolder: exp{expansion_factor}_k{sparsity}_lr{lr_tag}
-        # Format lr to match sweep script (printf "%g" style)
-        # This gives clean formatting: 0.001, 0.0005, 0.0001, etc.
-        lr_tag = f"{lr:g}".rstrip("0").rstrip(".")
-        hyperparam_subdir = f"exp{expansion_factor}_k{sparsity}_lr{lr_tag}"
+        # Create hyperparameter subfolder: exp{expansion_factor}_k{sparsity}_lr{lr_tag}_aux{coeff}_tgt{target}
+        # Format lr using scientific notation: 0.001 -> "1e-3", 0.0005 -> "5e-4", 0.0001 -> "1e-4"
+        lr_str = f"{lr:.0e}"
+        if "e" in lr_str:
+            mantissa, exp = lr_str.split("e")
+            # Normalize mantissa: remove decimal point, strip leading zeros
+            mantissa_clean = mantissa.replace(".", "").lstrip("0")
+            if not mantissa_clean:
+                mantissa_clean = "1"
+            lr_tag = f"{mantissa_clean}e{exp}"
+        else:
+            lr_tag = f"{lr:g}"
+
+        # Format aux_loss_coeff and aux_loss_target for folder name
+        if aux_loss_coeff == 0.0:
+            aux_tag = "noaux"
+        else:
+            # Format coeff using scientific notation: 0.001 -> "1e-3", 0.005 -> "5e-3", 0.01 -> "1e-2"
+            # Convert to proper scientific notation (mantissa between 1 and 10)
+            coeff_str = f"{aux_loss_coeff:.0e}"
+            if "e" in coeff_str:
+                mantissa, exp = coeff_str.split("e")
+                # Normalize mantissa: remove decimal point, strip leading zeros
+                mantissa_clean = mantissa.replace(".", "").lstrip("0")
+                if not mantissa_clean:
+                    mantissa_clean = "1"
+                coeff_tag = f"{mantissa_clean}e{exp}"
+            else:
+                coeff_tag = f"{aux_loss_coeff:g}"
+
+            # Format target using scientific notation: 0.005 -> "5e-3", 0.01 -> "1e-2", 0.02 -> "2e-2"
+            target_str = f"{aux_loss_target:.0e}"
+            if "e" in target_str:
+                mantissa, exp = target_str.split("e")
+                # Normalize mantissa: remove decimal point, strip leading zeros
+                mantissa_clean = mantissa.replace(".", "").lstrip("0")
+                if not mantissa_clean:
+                    mantissa_clean = "1"
+                target_tag = f"{mantissa_clean}e{exp}"
+            else:
+                target_tag = f"{aux_loss_target:g}"
+
+            aux_tag = f"aux{coeff_tag}_tgt{target_tag}"
+
+        hyperparam_subdir = f"exp{expansion_factor}_k{sparsity}_lr{lr_tag}_{aux_tag}"
         save_dir = f"{parent_dir}/{hyperparam_subdir}"
 
     # Create data loaders
@@ -333,6 +374,8 @@ def main(
             "lr": lr,
             "grad_acc_steps": grad_acc_steps,
             "seed": seed,
+            "aux_loss_coeff": aux_loss_coeff,
+            "aux_loss_target": aux_loss_target,
         },
     )
 

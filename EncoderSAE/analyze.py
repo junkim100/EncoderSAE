@@ -278,7 +278,7 @@ def analyze_language_features(
 
                     # Pass through SAE to get features
                     with torch.no_grad():
-                        _, features, _, _ = sae(batch_activations)
+                        _, features, _, _, _ = sae(batch_activations)
 
                         # Count which features fired for this language
                         for sample_features in features:
@@ -328,7 +328,7 @@ def analyze_language_features(
                     batch_activations = mean_pool(hidden_states, attention_mask)
 
                     # Pass through SAE
-                    _, features, _, _ = sae(batch_activations)
+                    _, features, _, _, _ = sae(batch_activations)
 
                     # Count which features fired
                     for sample_features in features:

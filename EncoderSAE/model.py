@@ -42,7 +42,7 @@ class EncoderSAE(nn.Module):
 
     def forward(
         self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass through the SAE.
 
@@ -50,17 +50,19 @@ class EncoderSAE(nn.Module):
             x: Input activations of shape (batch_size, input_dim)
 
         Returns:
-            tuple of (reconstructed, features, l0_norm, topk_mask):
+            tuple of (reconstructed, features, l0_norm, topk_mask, raw_features):
             - reconstructed: Reconstructed input (batch_size, input_dim)
             - features: Sparse feature activations (batch_size, dict_size)
             - l0_norm: Average number of active features per sample
             - topk_mask: Binary mask (batch_size, dict_size) indicating which features were in top-k
+            - raw_features: Raw feature activations before top-k (batch_size, dict_size)
         """
         # Encode: project to dictionary space
         features = self.encoder(x)  # (batch_size, dict_size)
 
         # Apply ReLU activation
-        features = F.relu(features)
+        raw_features = F.relu(features)  # Store before top-k for auxiliary loss
+        features = raw_features
 
         # TopK sparsity: keep only top-k features per sample
         topk_mask = None
@@ -86,7 +88,7 @@ class EncoderSAE(nn.Module):
         # Compute L0 norm (number of active features)
         l0_norm = (features > 0).float().sum(dim=1).mean()
 
-        return reconstructed, features, l0_norm, topk_mask
+        return reconstructed, features, l0_norm, topk_mask, raw_features
 
     def compute_loss(
         self,
@@ -94,6 +96,7 @@ class EncoderSAE(nn.Module):
         reconstructed: torch.Tensor,
         features: torch.Tensor,
         topk_mask: torch.Tensor,
+        raw_features: torch.Tensor,
         l1_coeff: float = 0.0,
         aux_loss_coeff: float = 0.0,
         aux_loss_target: float = 0.01,
@@ -106,9 +109,11 @@ class EncoderSAE(nn.Module):
             reconstructed: Reconstructed input (batch_size, input_dim)
             features: Sparse features (batch_size, dict_size)
             topk_mask: Binary mask (batch_size, dict_size) indicating which features were in top-k
+            raw_features: Raw feature activations before top-k (batch_size, dict_size)
             l1_coeff: L1 regularization coefficient (default: 0.0, not used in top-k)
             aux_loss_coeff: Coefficient for auxiliary loss that encourages feature usage (default: 0.0)
-            aux_loss_target: Target fraction of samples where each feature should appear in top-k (default: 0.01)
+            aux_loss_target: Target fraction of samples where each feature should activate (default: 0.01)
+                This is a fraction between 0 and 1 (e.g., 0.01 = 1% of samples)
 
         Returns:
             tuple of (loss, metrics_dict):
@@ -121,20 +126,22 @@ class EncoderSAE(nn.Module):
         # L1 regularization (optional, typically not used with top-k)
         l1_loss = features.abs().mean() * l1_coeff
 
-        # Auxiliary loss: encourage features to appear in top-k at least occasionally
-        # Compute fraction of samples where each feature appears in top-k
-        # topk_mask shape: (batch_size, dict_size)
-        feature_usage = topk_mask.float().mean(
-            dim=0
-        )  # (dict_size,) - fraction per feature
-
-        # Penalize features that are used less than target threshold
-        # This encourages dead features to start firing
+        # Auxiliary loss: encourage features to activate at least occasionally
+        # Use raw_features (before top-k) so gradients flow to all features
         if aux_loss_coeff > 0:
-            # Loss = mean over features of max(0, target - usage)^2
-            # This penalizes features with usage < target
-            usage_deficit = torch.clamp(aux_loss_target - feature_usage, min=0.0)
-            aux_loss = (usage_deficit.pow(2).mean()) * aux_loss_coeff
+            # Compute fraction of samples where each feature activates (activation > 0)
+            # raw_features shape: (batch_size, dict_size)
+            # This gives us the fraction of samples where each feature fires
+            feature_activation_fraction = (
+                (raw_features > 0).float().mean(dim=0)
+            )  # (dict_size,)
+
+            # Penalize features that activate in fewer than target fraction of samples
+            # aux_loss_target is the target fraction (e.g., 0.01 = 1% of samples)
+            activation_deficit = torch.clamp(
+                aux_loss_target - feature_activation_fraction, min=0.0
+            )
+            aux_loss = (activation_deficit.pow(2).mean()) * aux_loss_coeff
         else:
             aux_loss = torch.tensor(0.0, device=x.device)
 

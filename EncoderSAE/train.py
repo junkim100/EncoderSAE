@@ -92,12 +92,15 @@ def train_sae(
         with torch.no_grad():
             for activations in val_loader:
                 activations = activations.to(device)
-                reconstructed, features, l0_norm, topk_mask = model(activations)
+                reconstructed, features, l0_norm, topk_mask, raw_features = model(
+                    activations
+                )
                 loss, metrics = unwrap(model).compute_loss(
                     activations,
                     reconstructed,
                     features,
                     topk_mask,
+                    raw_features,
                     aux_loss_coeff=aux_loss_coeff,
                     aux_loss_target=aux_loss_target,
                 )
@@ -156,7 +159,9 @@ def train_sae(
             activations = activations.to(device)
 
             # Forward pass
-            reconstructed, features, l0_norm, topk_mask = model(activations)
+            reconstructed, features, l0_norm, topk_mask, raw_features = model(
+                activations
+            )
 
             # Compute loss (unwrap model if wrapped in DataParallel)
             loss, metrics = unwrap(model).compute_loss(
@@ -164,6 +169,7 @@ def train_sae(
                 reconstructed,
                 features,
                 topk_mask,
+                raw_features,
                 aux_loss_coeff=aux_loss_coeff,
                 aux_loss_target=aux_loss_target,
             )

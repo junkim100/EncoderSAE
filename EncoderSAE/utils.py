@@ -51,7 +51,9 @@ def setup_wandb(
     if run_name is None:
         # Auto-generate run name
         model_short = Path(model_name or "model").stem if model_name else "model"
-        dataset_short = Path(dataset_name or "dataset").stem if dataset_name else "dataset"
+        dataset_short = (
+            Path(dataset_name or "dataset").stem if dataset_name else "dataset"
+        )
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_name = f"{model_short}_{dataset_short}_exp{expansion_factor}_k{sparsity}_bs{batch_size}_{timestamp}"
 
@@ -72,6 +74,10 @@ def setup_wandb(
         config=wandb_config,
     )
 
+    # Explicitly update config to ensure wandb recognizes all values as columns
+    # This helps when config values might not show up in the UI automatically
+    wandb.config.update(wandb_config)
+
     return run
 
 
@@ -83,4 +89,3 @@ def get_device() -> torch.device:
         return torch.device("mps")
     else:
         return torch.device("cpu")
-
