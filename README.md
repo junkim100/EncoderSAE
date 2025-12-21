@@ -312,16 +312,123 @@ This will:
   - Only affects JSON reporting, does NOT affect mask generation
   - Masks always check ALL features, filtered by `mask_threshold`
 
-### Using Masks for Language-Agnostic Embeddings
+## Language-Agnostic Inference
 
-The library provides a convenient pipeline for creating language-agnostic embeddings:
+After training an SAE and analyzing language-specific features, you can create language-agnostic embeddings by removing language-specific features. The library provides three ways to do this:
 
-#### Option 1: Full Pipeline (Recommended)
+### Option 1: Class-Based Pipeline (Recommended for Repeated Use)
+
+The `LanguageAgnosticEncoder` class is ideal when you need to encode multiple batches, as it loads the model and SAE once and reuses them:
 
 ```python
 from EncoderSAE import LanguageAgnosticEncoder
 
-# Initialize the encoder with SAE and mask
+# Initialize the encoder (loads SAE and mask once)
+encoder = LanguageAgnosticEncoder(
+    model_name="intfloat/multilingual-e5-large",
+    sae_path="checkpoints/model_dataset/exp32_k1024_lr0.001/final_model.pt",
+    mask_path="analysis/.../language_features_combined_mask.pt",
+    batch_size=32,
+    max_length=512,
+    use_vllm=True,              # Use vLLM for faster inference
+    num_gpus=8,                 # Number of GPUs for vLLM
+    gpu_memory_utilization=0.9,
+)
+
+# Encode single text or list of texts
+texts = ["Hello world", "Bonjour le monde", "Hola mundo"]
+embeddings = encoder.encode(texts)
+# Shape: (3, dict_size) - language-specific features already removed
+
+# Can encode multiple batches efficiently
+more_texts = ["Another sentence", "Une autre phrase"]
+more_embeddings = encoder.encode(more_texts)
+```
+
+**Parameters:**
+- `model_name`: HuggingFace model ID (must match the model used for SAE training)
+- `sae_path`: Path to trained SAE checkpoint (`.pt` file)
+- `mask_path`: Path to language mask file (`.pt` file)
+  - Can use individual language mask: `language_features_{lang}_mask.pt`
+  - Or combined union mask: `language_features_combined_mask.pt` (recommended)
+- `batch_size`: Batch size for processing (default: 32)
+- `max_length`: Maximum sequence length (default: 512)
+- `use_vllm`: Use vLLM for faster base model inference (default: True)
+- `num_gpus`: Number of GPUs for vLLM (default: None = auto-detect)
+- `gpu_memory_utilization`: GPU memory utilization for vLLM (default: 0.9)
+
+### Option 2: Function-Based API (Convenient for One-Time Use)
+
+The `infer_language_agnostic` function provides a simple one-call interface:
+
+```python
+from EncoderSAE import infer_language_agnostic
+import torch
+
+# Full pipeline: text -> base model -> SAE -> mask -> output
+embeddings = infer_language_agnostic(
+    model_name="intfloat/multilingual-e5-large",
+    sae="checkpoints/.../final_model.pt",  # Can be path or EncoderSAE instance
+    mask_path="analysis/.../language_features_combined_mask.pt",
+    texts=["Hello world", "Bonjour le monde"],
+    batch_size=32,
+    max_length=512,
+    use_vllm=True,
+    num_gpus=8,
+    gpu_memory_utilization=0.9,
+)
+# Returns: torch.Tensor of shape (len(texts), dict_size)
+```
+
+**Note**: This function loads the model and SAE each time it's called, so use `LanguageAgnosticEncoder` if you need to encode multiple batches.
+
+### Option 3: Manual Feature Masking (For Custom Pipelines)
+
+If you already have SAE features and just need to apply the mask:
+
+```python
+from EncoderSAE import EncoderSAE, remove_language_features
+import torch
+
+# Load SAE and process activations
+sae = EncoderSAE(input_dim=1024, expansion_factor=32, sparsity=64)
+sae.load_state_dict(torch.load("checkpoints/.../final_model.pt"))
+sae.eval()
+
+# Get SAE features from activations
+activations = ...  # Your base model activations (batch_size, input_dim)
+with torch.no_grad():
+    _, features, _, _, _ = sae(activations)  # Get sparse features
+
+# Load mask and apply
+mask = torch.load("analysis/.../language_features_combined_mask.pt")
+language_agnostic_features = remove_language_features(features, mask)
+# Shape: (batch_size, dict_size) - language-specific features set to 0
+```
+
+### Understanding Masks
+
+Masks are boolean tensors of shape `(dict_size,)` where:
+- `True` (1) = language-specific feature (will be set to 0)
+- `False` (0) = contextual feature (preserved)
+
+**Mask Types:**
+- **Individual language mask** (`language_features_{lang}_mask.pt`): Features specific to one language
+- **Combined union mask** (`language_features_combined_mask.pt`): Features specific to ANY language (recommended for general use)
+
+### Use Cases
+
+1. **Cross-lingual semantic search**: Create embeddings that focus on meaning rather than language
+2. **Language-agnostic classification**: Train models that work across languages
+3. **Multilingual retrieval**: Find semantically similar content regardless of language
+4. **Bias reduction**: Remove language-specific artifacts from embeddings
+
+### Example: Complete Workflow
+
+```python
+from EncoderSAE import LanguageAgnosticEncoder
+
+# Step 1: Initialize encoder with trained SAE and language mask
 encoder = LanguageAgnosticEncoder(
     model_name="intfloat/multilingual-e5-large",
     sae_path="checkpoints/.../final_model.pt",
@@ -330,35 +437,18 @@ encoder = LanguageAgnosticEncoder(
     num_gpus=8,
 )
 
-# Encode texts directly (handles: text -> base model -> SAE -> mask -> output)
-texts = ["Hello world", "Bonjour le monde", "Hola mundo"]
-language_agnostic_embeddings = encoder.encode(texts)
-# Shape: (3, dict_size) - language-specific features already removed
+# Step 2: Encode texts in any language
+queries = [
+    "What is machine learning?",
+    "Qu'est-ce que l'apprentissage automatique?",
+    "¿Qué es el aprendizaje automático?",
+]
+embeddings = encoder.encode(queries)
+
+# Step 3: Use embeddings for downstream tasks
+# These embeddings focus on semantic content, not language identity
+# Similar meanings across languages will have similar embeddings
 ```
-
-#### Option 2: Function-Based API
-
-```python
-from EncoderSAE import infer_language_agnostic, remove_language_features
-import torch
-
-# Full pipeline function
-embeddings = infer_language_agnostic(
-    model_name="intfloat/multilingual-e5-large",
-    sae_path="checkpoints/.../final_model.pt",
-    mask_path="analysis/.../language_features_combined_mask.pt",
-    texts=["Hello world", "Bonjour le monde"],
-    use_vllm=True,
-    num_gpus=8,
-)
-
-# Or apply mask to existing SAE features
-features = sae(activations)[1]  # Get SAE features
-mask = torch.load("analysis/.../language_features_combined_mask.pt")
-features_agnostic = remove_language_features(features, mask)
-```
-
-The masks are boolean tensors where `True` (1) indicates language-specific features that are set to 0 to preserve only contextual information.
 
 ## Project Structure
 
