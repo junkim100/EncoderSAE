@@ -38,13 +38,84 @@ from .model import EncoderSAE
 from .data import ActivationDataset, load_data
 
 
+def _load_and_combine_mask(
+    mask_path: str,
+    dict_size: int,
+    device: torch.device,
+    languages_to_disable: Optional[list[str]] = None,
+) -> torch.Tensor:
+    """
+    Load mask from file and optionally combine per-language masks.
+
+    Args:
+        mask_path: Path to mask file
+        dict_size: Expected dictionary size
+        device: Device to load mask on
+        languages_to_disable: List of language codes to disable (e.g., ["en", "es"]).
+            If provided, mask_path should point to per-language masks dictionary.
+            If None, mask_path should point to union mask.
+
+    Returns:
+        Boolean mask tensor of shape (dict_size,)
+    """
+    mask_data = torch.load(mask_path, map_location=device)
+
+    # Handle different mask formats
+    if isinstance(mask_data, dict):
+        # Per-language masks dictionary
+        if languages_to_disable is None or len(languages_to_disable) == 0:
+            raise ValueError(
+                "mask_path points to per-language masks dictionary, but languages_to_disable is not provided. "
+                "Either provide languages_to_disable (e.g., ['en', 'es']) or use the union mask file."
+            )
+
+        # Combine masks for specified languages
+        mask = torch.zeros(dict_size, dtype=torch.bool, device=device)
+        available_languages = list(mask_data.keys())
+
+        for lang in languages_to_disable:
+            if lang not in mask_data:
+                raise ValueError(
+                    f"Language '{lang}' not found in mask file. "
+                    f"Available languages: {', '.join(sorted(available_languages))}"
+                )
+            mask |= mask_data[lang]  # Union: combine masks
+
+        print(
+            f"Combined mask for languages {languages_to_disable}: "
+            f"{mask.sum().item()} language-specific features will be removed"
+        )
+        return mask
+    else:
+        # Single union mask tensor
+        mask = mask_data
+        if mask.dtype != torch.bool:
+            mask = mask.bool()
+        if mask.shape[0] != dict_size:
+            raise ValueError(
+                f"Mask size {mask.shape[0]} does not match dict_size {dict_size}"
+            )
+
+        if languages_to_disable is not None and len(languages_to_disable) > 0:
+            print(
+                f"WARNING: languages_to_disable provided but mask_path points to union mask. "
+                f"Ignoring languages_to_disable and using union mask."
+            )
+
+        print(
+            f"Union mask loaded: {mask.sum().item()} language-specific features will be removed"
+        )
+        return mask
+
+
 def from_activations(
     activations_path: str,
     sae_path: str,
     mask_path: str,
-    output_path: str,
+    output_path: Optional[str] = None,
     batch_size: int = 32,
     device: Optional[str] = None,
+    languages_to_disable: Optional[list[str]] = None,
 ):
     """
     Convert existing activations to language-agnostic embeddings.
@@ -56,11 +127,15 @@ def from_activations(
         activations_path: Path to .pt file containing activations (shape: [num_samples, input_dim])
         sae_path: Path to trained SAE checkpoint (.pt file)
         mask_path: Path to language mask file (.pt file)
-            - Can be individual language mask: `language_features_{lang}_mask.pt`
-            - Or combined union mask: `language_features_combined_mask.pt` (recommended)
-        output_path: Path to save language-agnostic embeddings (.pt file)
+            - Union mask: `language_features_combined_mask.pt` (removes all language-specific features)
+            - Per-language masks: `language_features_per_language_masks.pt` (use with languages_to_disable)
+        output_path: Path to save language-agnostic embeddings (.pt file).
+            If None, auto-generates path based on input paths.
         batch_size: Batch size for processing (default: 32)
         device: Device to run on, e.g., "cuda" or "cpu" (auto-detected if None)
+        languages_to_disable: List of language codes to disable (e.g., ["en", "es"]).
+            If provided, mask_path should point to `language_features_per_language_masks.pt`.
+            If None, mask_path should point to `language_features_combined_mask.pt` (union mask).
     """
     # Set device
     if device is None:
@@ -111,6 +186,26 @@ def from_activations(
         f"Loaded {len(activations_tensor)} activations of dimension {activations_tensor.shape[1]}"
     )
 
+    # Auto-generate output path if not provided
+    if output_path is None:
+        activations_path_obj = Path(activations_path)
+        activations_stem = activations_path_obj.stem
+        mask_path_obj = Path(mask_path)
+        mask_stem = mask_path_obj.stem
+
+        # Create output directory based on activations directory
+        output_dir = activations_path_obj.parent / "embeddings"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Generate filename: {activations_stem}_{mask_stem}.pt
+        lang_suffix = (
+            f"_{'_'.join(languages_to_disable)}" if languages_to_disable else ""
+        )
+        output_path = str(
+            output_dir / f"{activations_stem}_{mask_stem}{lang_suffix}.pt"
+        )
+        print(f"Auto-generated output path: {output_path}")
+
     # Load SAE
     print(f"Loading SAE from {sae_path}")
     checkpoint = torch.load(sae_path, map_location=device)
@@ -145,15 +240,8 @@ def from_activations(
 
     # Load mask
     print(f"Loading mask from {mask_path}")
-    mask = torch.load(mask_path, map_location=device)
-    if mask.dtype != torch.bool:
-        mask = mask.bool()
-    if mask.shape[0] != sae.dict_size:
-        raise ValueError(
-            f"Mask size {mask.shape[0]} does not match SAE dict_size {sae.dict_size}"
-        )
-    print(
-        f"Mask loaded: {mask.sum().item()} language-specific features will be removed"
+    mask = _load_and_combine_mask(
+        mask_path, sae.dict_size, device, languages_to_disable
     )
 
     # Process activations in batches
@@ -195,7 +283,7 @@ def from_text(
     model_name: str,
     sae_path: str,
     mask_path: str,
-    output_path: str,
+    output_path: Optional[str] = None,
     texts: Optional[list[str]] = None,
     text_file: Optional[str] = None,
     batch_size: int = 32,
@@ -204,6 +292,7 @@ def from_text(
     use_vllm: bool = True,
     num_gpus: Optional[int] = None,
     gpu_memory_utilization: float = 0.9,
+    languages_to_disable: Optional[list[str]] = None,
 ):
     """
     Generate language-agnostic embeddings from text input.
@@ -215,9 +304,10 @@ def from_text(
         model_name: HuggingFace model ID or local path (same as used for SAE training)
         sae_path: Path to trained SAE checkpoint (.pt file)
         mask_path: Path to language mask file (.pt file)
-            - Can be individual language mask: `language_features_{lang}_mask.pt`
-            - Or combined union mask: `language_features_combined_mask.pt` (recommended)
-        output_path: Path to save language-agnostic embeddings (.pt file)
+            - Union mask: `language_features_combined_mask.pt` (removes all language-specific features)
+            - Per-language masks: `language_features_per_language_masks.pt` (use with languages_to_disable)
+        output_path: Path to save language-agnostic embeddings (.pt file).
+            If None, auto-generates path based on input paths.
         texts: List of text strings to encode (if provided, text_file is ignored)
         text_file: Path to text file (one text per line) or JSON/JSONL file with text column
             - If .txt: one text per line
@@ -228,6 +318,9 @@ def from_text(
         use_vllm: Use vLLM for faster base model inference (default: True)
         num_gpus: Number of GPUs to use for vLLM (default: None = auto-detect)
         gpu_memory_utilization: GPU memory utilization for vLLM (default: 0.9)
+        languages_to_disable: List of language codes to disable (e.g., ["en", "es"]).
+            If provided, mask_path should point to `language_features_per_language_masks.pt`.
+            If None, mask_path should point to `language_features_combined_mask.pt` (union mask).
     """
     # Set device
     if device is None:
@@ -269,12 +362,53 @@ def from_text(
 
     print(f"Processing {len(input_texts)} texts...")
 
-    # Use the inference function to get language-agnostic embeddings
-    embeddings = infer_language_agnostic(
+    # Auto-generate output path if not provided
+    if output_path is None:
+        # Determine source name
+        if text_file is not None:
+            text_file_obj = Path(text_file)
+            source_name = text_file_obj.stem
+            output_dir = text_file_obj.parent / "embeddings"
+        else:
+            source_name = "texts"
+            output_dir = Path("./embeddings")
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Get mask name for filename
+        mask_path_obj = Path(mask_path)
+        mask_stem = mask_path_obj.stem
+
+        # Generate filename: {source_name}_{mask_stem}.pt
+        lang_suffix = (
+            f"_{'_'.join(languages_to_disable)}" if languages_to_disable else ""
+        )
+        output_path = str(output_dir / f"{source_name}_{mask_stem}{lang_suffix}.pt")
+        print(f"Auto-generated output path: {output_path}")
+
+    # Load SAE to get dict_size for mask loading
+    checkpoint = torch.load(sae_path, map_location=device_obj)
+    if "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    elif isinstance(checkpoint, dict) and "encoder.weight" in checkpoint:
+        state_dict = checkpoint
+    else:
+        raise ValueError(f"Could not parse checkpoint format from {sae_path}")
+
+    encoder_weight = state_dict["encoder.weight"]
+    dict_size = encoder_weight.shape[0]
+
+    # Load and combine mask if needed
+    mask = _load_and_combine_mask(
+        mask_path, dict_size, device_obj, languages_to_disable
+    )
+
+    # Use LanguageAgnosticEncoder but replace its mask after loading
+    # This allows us to use the full pipeline with our custom combined mask
+    encoder = LanguageAgnosticEncoder(
         model_name=model_name,
-        sae=sae_path,
-        mask_path=mask_path,
-        texts=input_texts,
+        sae_path=sae_path,
+        mask_path=mask_path,  # Will be loaded but then replaced
         batch_size=batch_size,
         max_length=max_length,
         device=device_obj,
@@ -282,6 +416,12 @@ def from_text(
         num_gpus=num_gpus,
         gpu_memory_utilization=gpu_memory_utilization,
     )
+
+    # Replace the encoder's mask with our combined mask
+    encoder.mask = mask
+
+    # Now encode with our custom mask
+    embeddings = encoder.encode(input_texts)
 
     print(
         f"Generated {len(embeddings)} language-agnostic embeddings of dimension {embeddings.shape[1]}"

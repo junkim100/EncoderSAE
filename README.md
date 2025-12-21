@@ -287,21 +287,20 @@ This will:
    - `total_samples`: Number of samples per language
    - `unique_features`: Number of unique features that fired
 
-2. **`language_features_{language}_mask.pt`**: Individual mask per language
-   - Boolean tensor (dict_size,) where 1 = feature fires >threshold% for that language
-   - Use to remove language-specific features for a specific language
-
-3. **`language_features_combined_masks.pt`**: Dictionary of all language masks
+2. **`language_features_per_language_masks.pt`**: Dictionary of all language masks
    - `{language: mask_tensor}` for all languages
-   - Convenient way to load all masks at once
+   - Each mask is a boolean tensor (dict_size,) where 1 = feature fires >threshold% for that language
+   - Use with `languages_to_disable` parameter in inference to disable specific languages or combinations
+   - Example: `{"en": tensor([...]), "fr": tensor([...]), "es": tensor([...]), ...}`
 
-4. **`language_features_combined_index.pt`**: Combined feature index
+3. **`language_features_combined_index.pt`**: Combined feature index
    - Contains tensor of all language-specific feature indices (union across languages)
    - Metadata: number of features, languages, mask_threshold used
+   - Useful for inspection and analysis
 
-5. **`language_features_combined_mask.pt`**: Union mask for all languages
-   - Boolean tensor where 1 = language-specific in ANY language
-   - Use this to remove ALL language-specific features at once
+4. **`language_features_combined_mask.pt`**: Union mask for all languages
+   - Boolean tensor (dict_size,) where 1 = language-specific in ANY language
+   - Use this to remove ALL language-specific features at once (recommended for general use)
 
 ### Analysis Arguments
 
@@ -321,11 +320,21 @@ After training an SAE and analyzing language-specific features, you can create l
 Convert pre-computed base model activations to language-agnostic embeddings. This is useful when you already have extracted activations and want to apply the SAE and mask without re-running the base model.
 
 ```bash
+# Remove all language-specific features (union mask)
 uv run -m EncoderSAE.inference_main from_activations \
     --activations_path="./activations/model_dataset/model.pt" \
     --sae_path="./checkpoints/model_dataset/exp32_k1024_lr0.001/final_model.pt" \
     --mask_path="./analysis/.../language_features_combined_mask.pt" \
     --output_path="./embeddings/language_agnostic.pt" \
+    --batch_size=32
+
+# Remove features for specific languages only (e.g., English and Spanish)
+uv run -m EncoderSAE.inference_main from_activations \
+    --activations_path="./activations/model_dataset/model.pt" \
+    --sae_path="./checkpoints/model_dataset/exp32_k1024_lr0.001/final_model.pt" \
+    --mask_path="./analysis/.../language_features_per_language_masks.pt" \
+    --languages_to_disable='["en", "es"]' \
+    --output_path="./embeddings/language_agnostic_no_en_es.pt" \
     --batch_size=32
 ```
 
@@ -333,18 +342,21 @@ uv run -m EncoderSAE.inference_main from_activations \
 - `activations_path`: Path to `.pt` file containing base model activations (shape: `[num_samples, input_dim]`)
 - `sae_path`: Path to trained SAE checkpoint (`.pt` file)
 - `mask_path`: Path to language mask file (`.pt` file)
-  - Can use individual language mask: `language_features_{lang}_mask.pt`
-  - Or combined union mask: `language_features_combined_mask.pt` (recommended)
+  - Union mask: `language_features_combined_mask.pt` (removes all language-specific features)
+  - Per-language masks: `language_features_per_language_masks.pt` (use with `languages_to_disable`)
 - `output_path`: Path to save language-agnostic embeddings (`.pt` file)
 - `batch_size`: Batch size for processing (default: 32)
 - `device`: Device to run on, e.g., "cuda" or "cpu" (auto-detected if None)
+- `languages_to_disable`: List of language codes to disable (e.g., `["en", "es"]`).
+  - If provided, `mask_path` should point to `language_features_per_language_masks.pt`.
+  - If `None`, `mask_path` should point to `language_features_combined_mask.pt` (union mask).
 
 ### Mode 2: From Text Input (`from_text`)
 
 Generate language-agnostic embeddings directly from text input. This runs the full pipeline: text → base model → SAE → mask → embeddings.
 
 ```bash
-# From text file (.txt, .json, or .jsonl)
+# From text file - remove all language-specific features (union mask)
 uv run -m EncoderSAE.inference_main from_text \
     --model_name="intfloat/multilingual-e5-large" \
     --sae_path="./checkpoints/.../final_model.pt" \
@@ -356,6 +368,17 @@ uv run -m EncoderSAE.inference_main from_text \
     --use_vllm=True \
     --num_gpus=8 \
     --gpu_memory_utilization=0.9
+
+# From text file - remove features for specific languages only
+uv run -m EncoderSAE.inference_main from_text \
+    --model_name="intfloat/multilingual-e5-large" \
+    --sae_path="./checkpoints/.../final_model.pt" \
+    --mask_path="./analysis/.../language_features_per_language_masks.pt" \
+    --languages_to_disable='["en", "fr"]' \
+    --text_file="./data/my_texts.txt" \
+    --output_path="./embeddings/language_agnostic_no_en_fr.pt" \
+    --batch_size=32 \
+    --use_vllm=True
 ```
 
 **Text File Formats:**
@@ -366,6 +389,8 @@ uv run -m EncoderSAE.inference_main from_text \
 - `model_name`: HuggingFace model ID or local path (must match model used for SAE training)
 - `sae_path`: Path to trained SAE checkpoint (`.pt` file)
 - `mask_path`: Path to language mask file (`.pt` file)
+  - Union mask: `language_features_combined_mask.pt` (removes all language-specific features)
+  - Per-language masks: `language_features_per_language_masks.pt` (use with `languages_to_disable`)
 - `output_path`: Path to save language-agnostic embeddings (`.pt` file)
 - `texts`: List of text strings (if provided, `text_file` is ignored)
 - `text_file`: Path to text file (one text per line) or JSON/JSONL file with text column
@@ -375,6 +400,9 @@ uv run -m EncoderSAE.inference_main from_text \
 - `use_vllm`: Use vLLM for faster base model inference (default: True)
 - `num_gpus`: Number of GPUs for vLLM (default: None = auto-detect)
 - `gpu_memory_utilization`: GPU memory utilization for vLLM (default: 0.9)
+- `languages_to_disable`: List of language codes to disable (e.g., `["en", "es"]`).
+  - If provided, `mask_path` should point to `language_features_per_language_masks.pt`.
+  - If `None`, `mask_path` should point to `language_features_combined_mask.pt` (union mask).
 
 ### Understanding Masks
 
@@ -383,8 +411,8 @@ Masks are boolean tensors of shape `(dict_size,)` where:
 - `False` (0) = contextual feature (preserved)
 
 **Mask Types:**
-- **Individual language mask** (`language_features_{lang}_mask.pt`): Features specific to one language
-- **Combined union mask** (`language_features_combined_mask.pt`): Features specific to ANY language (recommended for general use)
+- **Per-language masks dictionary** (`language_features_per_language_masks.pt`): Dictionary containing individual masks for each language `{language: mask_tensor}`. Use with `languages_to_disable` parameter to disable specific languages or combinations (e.g., `["en", "es"]`).
+- **Union mask** (`language_features_combined_mask.pt`): Single boolean tensor where `True` indicates features that are language-specific in ANY language. Use this to remove all language-specific features at once (recommended for general use).
 
 ### Output Format
 
@@ -416,12 +444,24 @@ uv run -m EncoderSAE.analyze_main \
     --mask_threshold=0.8
 
 # Step 3: Generate language-agnostic embeddings
+# Option A: Remove all language-specific features
 uv run -m EncoderSAE.inference_main from_text \
     --model_name="intfloat/multilingual-e5-large" \
     --sae_path="./checkpoints/.../final_model.pt" \
     --mask_path="./analysis/.../language_features_combined_mask.pt" \
     --text_file="./data/queries.txt" \
     --output_path="./embeddings/queries_agnostic.pt" \
+    --use_vllm=True \
+    --num_gpus=8
+
+# Option B: Remove features for specific languages only (e.g., English and Spanish)
+uv run -m EncoderSAE.inference_main from_text \
+    --model_name="intfloat/multilingual-e5-large" \
+    --sae_path="./checkpoints/.../final_model.pt" \
+    --mask_path="./analysis/.../language_features_per_language_masks.pt" \
+    --languages_to_disable='["en", "es"]' \
+    --text_file="./data/queries.txt" \
+    --output_path="./embeddings/queries_no_en_es.pt" \
     --use_vllm=True \
     --num_gpus=8
 

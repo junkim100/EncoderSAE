@@ -483,20 +483,19 @@ def analyze_language_features(
             f"(>{mask_threshold_pct}% of {total_samples} samples)"
         )
 
-        # Save individual mask as .pt file
-        mask_path = output_path / f"language_features_{language}_mask.pt"
-        torch.save(mask, mask_path)
-        print(f"  Saved mask to {mask_path}")
-
-        # Store in combined dictionary
+        # Store in combined dictionary (individual files not saved - use per_language_masks.pt instead)
         all_masks[language] = mask
 
-    # Save combined mask file with all languages
-    combined_mask_path = output_path / "language_features_combined_masks.pt"
-    torch.save(all_masks, combined_mask_path)
-    print(f"\nCombined masks saved to {combined_mask_path}")
+    # Save per-language masks dictionary (all individual language masks in one file)
+    per_language_masks_path = output_path / "language_features_per_language_masks.pt"
+    torch.save(all_masks, per_language_masks_path)
+    print(f"\nPer-language masks saved to {per_language_masks_path}")
     print(
         f"  Contains masks for {len(all_masks)} languages: {', '.join(sorted(all_masks.keys()))}"
+    )
+    print(
+        f"  Usage: Load this file to get individual masks for each language, "
+        f"then combine them to disable specific languages"
     )
 
     # Create combined index of all language-specific features (union across all languages)
