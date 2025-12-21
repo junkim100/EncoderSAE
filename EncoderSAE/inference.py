@@ -411,7 +411,14 @@ class LanguageAgnosticEncoder:
                             sys.stdout = original_stdout
                             sys.stderr = original_stderr
 
-                for batch_idx in range(num_batches):
+                from tqdm import tqdm
+
+                for batch_idx in tqdm(
+                    range(num_batches),
+                    desc="Extracting base embeddings",
+                    unit="batch",
+                    total=num_batches,
+                ):
                     start_idx = batch_idx * self.batch_size
                     end_idx = min(start_idx + self.batch_size, len(texts))
                     batch_texts = texts[start_idx:end_idx]
@@ -497,7 +504,14 @@ class LanguageAgnosticEncoder:
             with torch.no_grad():
                 num_batches = (len(texts) + self.batch_size - 1) // self.batch_size
 
-                for batch_idx in range(num_batches):
+                from tqdm import tqdm
+
+                for batch_idx in tqdm(
+                    range(num_batches),
+                    desc="Extracting base embeddings",
+                    unit="batch",
+                    total=num_batches,
+                ):
                     start_idx = batch_idx * self.batch_size
                     end_idx = min(start_idx + self.batch_size, len(texts))
                     batch_texts = texts[start_idx:end_idx]
@@ -522,11 +536,28 @@ class LanguageAgnosticEncoder:
 
             base_embeddings = torch.cat(all_activations, dim=0)
 
-        # Pass through SAE to get features
+        # Pass through SAE to get features in batches to avoid OOM
+        all_features = []
+        sae_batch_size = self.batch_size
+        num_sae_batches = (len(base_embeddings) + sae_batch_size - 1) // sae_batch_size
+
+        from tqdm import tqdm
+
         with torch.no_grad():
-            _, features, _, _ = self.sae(base_embeddings)
+            for sae_batch_idx in tqdm(
+                range(num_sae_batches),
+                desc="Processing through SAE",
+                unit="batch",
+                total=num_sae_batches,
+            ):
+                sae_start_idx = sae_batch_idx * sae_batch_size
+                sae_end_idx = min(sae_start_idx + sae_batch_size, len(base_embeddings))
+                sae_batch_embeddings = base_embeddings[sae_start_idx:sae_end_idx]
 
-        # Remove language-specific features using the already-loaded mask
-        features_agnostic = remove_language_features(features, self.mask)
+                _, features, _, _, _ = self.sae(sae_batch_embeddings)
 
-        return features_agnostic
+                # Remove language-specific features using the already-loaded mask
+                features_agnostic = remove_language_features(features, self.mask)
+                all_features.append(features_agnostic)
+
+        return torch.cat(all_features, dim=0)

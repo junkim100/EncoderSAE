@@ -28,6 +28,7 @@ from typing import Optional
 
 import fire
 import torch
+from tqdm import tqdm
 
 from .inference import (
     LanguageAgnosticEncoder,
@@ -250,7 +251,12 @@ def from_activations(
     num_batches = (len(activations_tensor) + batch_size - 1) // batch_size
 
     with torch.no_grad():
-        for batch_idx in range(num_batches):
+        for batch_idx in tqdm(
+            range(num_batches),
+            desc="Processing activations",
+            unit="batch",
+            total=num_batches,
+        ):
             start_idx = batch_idx * batch_size
             end_idx = min(start_idx + batch_size, len(activations_tensor))
             batch_activations = activations_tensor[start_idx:end_idx]
@@ -262,9 +268,6 @@ def from_activations(
             features_agnostic = remove_language_features(features, mask)
 
             all_embeddings.append(features_agnostic.cpu())
-
-            if (batch_idx + 1) % 10 == 0:
-                print(f"Processed {end_idx}/{len(activations_tensor)} samples")
 
     # Stack all embeddings
     embeddings = torch.cat(all_embeddings, dim=0)
@@ -420,7 +423,8 @@ def from_text(
     # Replace the encoder's mask with our combined mask
     encoder.mask = mask
 
-    # Now encode with our custom mask
+    # Now encode with our custom mask (progress bars are handled inside encode method)
+    print(f"Processing {len(input_texts)} texts...")
     embeddings = encoder.encode(input_texts)
 
     print(
