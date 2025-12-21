@@ -131,9 +131,15 @@ class EncoderSAE(nn.Module):
         if aux_loss_coeff > 0:
             # Compute fraction of samples where each feature activates (activation > 0)
             # raw_features shape: (batch_size, dict_size)
-            # This gives us the fraction of samples where each feature fires
-            feature_activation_fraction = (
-                (raw_features > 0).float().mean(dim=0)
+            # Use sigmoid as differentiable approximation of step function
+            # High temperature (100) makes it approximate (raw_features > 0) closely
+            # This ensures gradients flow through the computation
+            temperature = 100.0
+            activation_indicator = torch.sigmoid(
+                raw_features * temperature
+            )  # Differentiable approximation
+            feature_activation_fraction = activation_indicator.mean(
+                dim=0
             )  # (dict_size,)
 
             # Penalize features that activate in fewer than target fraction of samples
