@@ -14,42 +14,42 @@ set -euo pipefail
 MODEL="intfloat/multilingual-e5-large"
 DATASET="data/4lang_train.jsonl"
 VAL_DATASET="data/4lang_validation.jsonl"
-VAL_STEP=500
-BATCH_SIZE=8192
+VAL_STEP=100
+BATCH_SIZE=32768
 GRAD_ACC_STEPS=1
-CHECKPOINT_STEPS=1000
+LOG_STEPS=10
+CHECKPOINT_STEPS=100
 NUM_GPUS=8
 GPU_MEM_UTIL=0.95
 
 # Encoder output dimension for intfloat/multilingual-e5-large
 INPUT_DIM=1024
 
-# Sweep ranges
+# Sweep ranges - Focused sweep to test auxiliary loss effectiveness
+# Total runs: 2 exp_factors * 1 sparsity * 2 lrs * 3 aux_coeffs * 2 aux_targets = 24 runs
+
 # Expansion factors to try
-EXPANSION_FACTORS=(32 64 128)
+# Focus on 32 and 64 (skip 128 to reduce sweep size)
+EXPANSION_FACTORS=(32 64)
 
 # Target sparsity ratios (k / dict_size)
-# Focused on moderate ratios that showed promise: 0.5%, 1%, 2%
-# (0.1% was too sparse and led to high dead features)
-SPARSITY_RATIOS=(0.005 0.01 0.02)
+# Use balanced default ratio
+SPARSITY_RATIOS=(0.01)
 
 # Learning rates
 # Focus on LRs that performed well: 5e-4 and 1e-3
-# Also test 2e-4 as a middle ground, and 1e-4 with aux_loss to see if it helps
-LRS=(1e-3 5e-4 2e-4 1e-4)
+LRS=(5e-4 1e-3)
 
 # Auxiliary loss coefficient
-# 0.0 = no aux loss (baseline)
-# 1e-3 = default (moderate)
+# 0.0 = no aux loss (baseline to compare against)
+# 1e-3 = moderate (default)
 # 1e-2 = stronger (more aggressive dead feature reduction)
-# 5e-3 = middle ground
-AUX_LOSS_COEFFS=(0.0 1e-3 5e-3 1e-2)
+AUX_LOSS_COEFFS=(0.0 1e-3 1e-2)
 
-# Auxiliary loss target (fraction of samples where each feature should appear in top-k)
-# 0.005 = 0.5% (more aggressive, encourages more features to fire)
+# Auxiliary loss target (fraction of samples where each feature should activate)
 # 0.01 = 1% (default, balanced)
 # 0.02 = 2% (less aggressive, allows some features to be more specialized)
-AUX_LOSS_TARGETS=(0.005 0.01 0.02)
+AUX_LOSS_TARGETS=(0.01 0.02)
 
 for ef in "${EXPANSION_FACTORS[@]}"; do
   dict_size=$((INPUT_DIM * ef))
@@ -91,7 +91,15 @@ EOF
   for k in "${SPARSITIES[@]}"; do
     for lr in "${LRS[@]}"; do
       for aux_coeff in "${AUX_LOSS_COEFFS[@]}"; do
-        for aux_target in "${AUX_LOSS_TARGETS[@]}"; do
+        # When aux_loss_coeff is 0.0, aux_loss_target has no effect
+        # So only test one target value (use 0.01) to avoid duplicate runs
+        if (( $(echo "${aux_coeff} == 0.0" | bc -l) )); then
+          TARGETS_TO_TEST=(0.01)
+        else
+          TARGETS_TO_TEST=("${AUX_LOSS_TARGETS[@]}")
+        fi
+
+        for aux_target in "${TARGETS_TO_TEST[@]}"; do
           # Derive a concise run name for WandB / logs
           lr_tag=$(printf "%g" "$lr")
           model_short="${MODEL//\//_}"
@@ -142,6 +150,7 @@ EOF
             --batch_size="${BATCH_SIZE}" \
             --grad_acc_steps="${GRAD_ACC_STEPS}" \
             --lr="${lr}" \
+            --log_steps="${LOG_STEPS}" \
             --checkpoint_steps="${CHECKPOINT_STEPS}" \
             --num_gpus="${NUM_GPUS}" \
             --use_vllm=True \
