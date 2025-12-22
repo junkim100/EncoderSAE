@@ -1,29 +1,48 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Hyperparameter sweep for EncoderSAE with auxiliary loss
-
+# Model and dataset configuration
 MODEL="intfloat/multilingual-e5-large"
 DATASET="data/4lang_train.jsonl"
 VAL_DATASET="data/4lang_validation.jsonl"
-VAL_STEP=50
-BATCH_SIZE=294912
-GRAD_ACC_STEPS=1
-LOG_STEPS=5
-CHECKPOINT_STEPS=50
-NUM_GPUS=2
-GPU_MEM_UTIL=0.95
 
-INPUT_DIM=1024
+# Training configuration
+VAL_STEP=50                    # Run validation every N steps
+BASE_BATCH_SIZE=294912        # Base batch size for expansion factor 32 (scales down for larger factors)
+GRAD_ACC_STEPS=1              # Gradient accumulation steps
+LOG_STEPS=5                    # Log metrics every N steps
+CHECKPOINT_STEPS=50           # Save checkpoint every N steps
+NUM_GPUS=2                     # Number of GPUs for distributed training
+GPU_MEM_UTIL=0.95             # GPU memory utilization for vLLM (0.0-1.0)
 
-EXPANSION_FACTORS=(32 64 128)
-SPARSITY_RATIOS=(0.01 0.025 0.05)
-LRS=(5e-4 1e-3)
-AUX_LOSS_COEFFS=(0.0 1e-3 1e-2)
-AUX_LOSS_TARGETS=(0.01 0.02)
+# Model architecture
+INPUT_DIM=1024                 # Input dimension (must match encoder model output)
+
+# Hyperparameter sweep ranges
+EXPANSION_FACTORS=(32 64 128)  # Dictionary size = INPUT_DIM * expansion_factor
+SPARSITY_RATIOS=(0.005 0.01 0.02 0.03)  # Sparsity k = dict_size * ratio (rounded to nearest 1024)
+LRS=(3e-4 5e-4)                # Learning rates to sweep
+AUX_LOSS_COEFFS=(0.0 0.1 0.5 1.0)  # Auxiliary loss coefficients (0.0 = no aux loss)
+AUX_LOSS_TARGETS=(0.02 0.05)   # Target activation fraction for auxiliary loss
+
+####################################################################################################
 
 for ef in "${EXPANSION_FACTORS[@]}"; do
   dict_size=$((INPUT_DIM * ef))
+
+  if [ "${ef}" -eq 32 ]; then
+    BATCH_SIZE=${BASE_BATCH_SIZE}
+  elif [ "${ef}" -eq 64 ]; then
+    BATCH_SIZE=$((BASE_BATCH_SIZE / 2))
+  elif [ "${ef}" -eq 128 ]; then
+    BATCH_SIZE=$((BASE_BATCH_SIZE / 4))
+  elif [ "${ef}" -eq 256 ]; then
+    BATCH_SIZE=$((BASE_BATCH_SIZE / 8))
+  else
+    BATCH_SIZE=$((BASE_BATCH_SIZE * 32 / ef))
+  fi
+
+  echo "Expansion factor: ${ef}, dict_size=${dict_size}, batch_size=${BATCH_SIZE}"
 
   declare -a SPARSITIES=()
   declare -A SEEN=()
@@ -51,7 +70,7 @@ EOF
     fi
   done
 
-  echo "Expansion factor: ${ef}, dict_size=${dict_size}, sparsities=${SPARSITIES[*]}"
+  echo "  sparsities=${SPARSITIES[*]}"
 
   for k in "${SPARSITIES[@]}"; do
     for lr in "${LRS[@]}"; do
