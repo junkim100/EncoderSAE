@@ -30,12 +30,35 @@ uv pip install -e .
 pip install -e .
 ```
 
+### Installing Evaluation Dependencies
+
+For evaluation scripts, install additional dependencies:
+
+```bash
+# Using uv
+uv pip install sentence-transformers beir
+
+# Using pip
+pip install sentence-transformers beir
+```
+
 ### Requirements
 
+**Core dependencies** (installed automatically):
 - Python >= 3.8
 - PyTorch >= 2.0.0
-- CUDA/MPS support (optional, for GPU acceleration)
-- vLLM (optional, for faster activation extraction with `--use_vllm`)
+- transformers >= 4.30.0
+- datasets >= 2.14.0
+- fire >= 0.5.0
+- wandb >= 0.15.0
+- tqdm >= 4.65.0
+- numpy >= 1.24.0
+
+**Optional dependencies** (install separately if needed):
+- `sentence-transformers`: Required for evaluation scripts (`evaluation/base_eval.py`, `evaluation/sae_eval.py`)
+- `beir`: Required for evaluation scripts (BEIR retrieval evaluation framework)
+- `vllm >= 0.2.0`: For faster activation extraction with `--use_vllm` (recommended for large-scale training)
+- CUDA/MPS support: For GPU acceleration
 
 ## Quick Start
 
@@ -485,6 +508,202 @@ uv run -m EncoderSAE.inference_main from_text \
 # Similar meanings across languages will have similar embeddings
 ```
 
+## Evaluation
+
+EncoderSAE provides two evaluation scripts for benchmarking embedding models on retrieval tasks using the BEIR evaluation framework. These scripts support both standard dense embeddings and SAE-based language-agnostic embeddings.
+
+**Quick Reference:**
+- **`base_eval.py`**: Evaluate baseline embedding models (without SAE)
+- **`sae_eval.py`**: Evaluate SAE-based language-agnostic embeddings
+- **Dependencies**: Requires `sentence-transformers` and `beir` (install separately)
+- **Output**: JSON files with NDCG, MAP, Recall, and Precision metrics at multiple k values
+- **Format**: BEIR-compatible JSONL datasets (queries.jsonl, corpus.jsonl, qrels.jsonl)
+
+### Base Model Evaluation (`base_eval.py`)
+
+Evaluate standard embedding models (without SAE) on multilingual retrieval datasets. This script provides baseline performance metrics for comparison with SAE-enhanced embeddings.
+
+```bash
+# Evaluate a model on a single dataset
+python evaluation/base_eval.py run \
+    --model="Qwen/Qwen3-Embedding-0.6B" \
+    --data_dirs='["/path/to/dataset"]' \
+    --results_root="./results_base" \
+    --batch_size=1024
+
+# Evaluate on multiple datasets
+python evaluation/base_eval.py run \
+    --model="intfloat/multilingual-e5-large" \
+    --data_dirs='["/path/to/dataset1", "/path/to/dataset2"]' \
+    --results_root="./results_base" \
+    --batch_size=2048 \
+    --overwrite=False
+```
+
+**Parameters:**
+- `model`: HuggingFace model ID or local path to evaluate (**required**)
+- `data_dirs`: List of dataset directory paths (**required**)
+  - Each directory should contain `queries.jsonl`, `corpus.jsonl`, and `qrels.jsonl`
+- `results_root`: Root directory for storing evaluation results (default: `"./results_base"`)
+- `batch_size`: Batch size for encoding queries and corpus (default: `1024`)
+- `overwrite`: If `True`, re-evaluates even when results already exist (default: `False`)
+
+**Dataset Format:**
+Each dataset directory should contain three JSONL files:
+- `queries.jsonl`: One query per line, format `{"_id": "qid", "text": "query text"}` or `{"qid": "query text"}`
+- `corpus.jsonl`: One document per line, format `{"doc_id": {"text": "document text", "title": "optional title"}}`
+- `qrels.jsonl`: Relevance judgments, format `{"qid": {"doc_id": relevance_score}}`
+
+**Output:**
+Results are saved as JSON files in `{results_root}/{model_safe_name}/{dataset_name}_results.json`:
+```json
+{
+  "model": "Qwen/Qwen3-Embedding-0.6B",
+  "dataset": "Belebele_test",
+  "ndcg": {"NDCG@1": 0.45, "NDCG@3": 0.52, "NDCG@20": 0.61, ...},
+  "map": {"MAP@100": 0.58, ...},
+  "recall": {"Recall@1": 0.32, "Recall@20": 0.75, ...},
+  "precision": {"P@1": 0.32, "P@20": 0.15, ...}
+}
+```
+
+**Metrics:**
+- **NDCG@k**: Normalized Discounted Cumulative Gain at k (higher is better)
+- **MAP@k**: Mean Average Precision at k (higher is better)
+- **Recall@k**: Fraction of relevant documents retrieved in top-k (higher is better)
+- **Precision@k**: Fraction of retrieved documents that are relevant (higher is better)
+
+Metrics are computed at k = [1, 3, 5, 10, 20, 100, 1000].
+
+### SAE-Based Evaluation (`sae_eval.py`)
+
+Evaluate language-agnostic embeddings created using SAE and language masks. This script measures how well SAE-enhanced embeddings perform on cross-lingual retrieval tasks.
+
+```bash
+# Evaluate SAE embeddings using sparse features (default)
+python evaluation/sae_eval.py run_sae_eval \
+    --model="Alibaba-NLP/gte-multilingual-base" \
+    --sae_path="./checkpoints/.../final_model.pt" \
+    --mask_path="./analysis/.../language_features_combined_mask.pt" \
+    --data_dirs='["/path/to/dataset"]' \
+    --results_root="./results_sae_eval" \
+    --batch_size=128
+
+# Evaluate using reconstructed embeddings (back to base embedding space)
+python evaluation/sae_eval.py run_sae_eval \
+    --model="Alibaba-NLP/gte-multilingual-base" \
+    --sae_path="./checkpoints/.../final_model.pt" \
+    --mask_path="./analysis/.../language_features_combined_mask.pt" \
+    --data_dirs='["/path/to/dataset"]' \
+    --use_reconstruction=True \
+    --batch_size=128
+
+# Evaluate on multiple custom datasets
+python evaluation/sae_eval.py run_sae_eval \
+    --model="intfloat/multilingual-e5-large" \
+    --sae_path="./checkpoints/.../final_model.pt" \
+    --mask_path="./analysis/.../language_features_combined_mask.pt" \
+    --data_dirs='["/path/to/dataset1", "/path/to/dataset2"]' \
+    --use_reconstruction=False
+```
+
+**Parameters:**
+- `model`: Base model name (must match the model used for SAE training) - **required**
+- `sae_path`: Path to trained SAE checkpoint (`.pt` file) - **required**
+- `mask_path`: Path to language mask file (`.pt` file) - **required**
+  - Use `language_features_combined_mask.pt` for union mask (removes all language-specific features)
+  - Use `language_features_per_language_masks.pt` with `languages_to_disable` for selective removal
+- `data_dirs`: List of dataset directory paths (**required**)
+- `results_root`: Root directory for storing evaluation results (default: `"./results_sae_eval"`)
+- `batch_size`: Batch size for encoding and SAE processing (default: `128`)
+- `use_reconstruction`: If `True`, reconstructs back to base embedding space instead of using sparse features (default: `False`)
+  - `False`: Uses sparse SAE feature activations directly (higher dimensional, more interpretable)
+  - `True`: Reconstructs to original embedding dimension (same as base model, but language-agnostic)
+
+**How It Works:**
+1. Encodes queries and corpus texts using the base `SentenceTransformer` model
+2. Passes embeddings through the SAE to extract sparse features
+3. Applies the language mask to zero out language-specific features
+4. Optionally reconstructs back to base embedding space (if `use_reconstruction=True`)
+5. Computes cosine similarities and evaluates retrieval performance
+
+**Output:**
+Results are saved as JSON files in `{results_root}/{model_safe_name}_{sae_safe_name}/{dataset_name}_{features|reconstructed}_results.json`:
+```json
+{
+  "model": "Alibaba-NLP/gte-multilingual-base",
+  "sae": "./checkpoints/.../final_model.pt",
+  "mask": "./analysis/.../language_features_combined_mask.pt",
+  "dataset": "Belebele_test",
+  "ndcg": {"NDCG@1": 0.48, "NDCG@20": 0.65, ...},
+  "map": {"MAP@100": 0.62, ...},
+  "recall": {"Recall@1": 0.35, "Recall@20": 0.78, ...},
+  "precision": {"P@1": 0.35, "P@20": 0.16, ...},
+  "use_reconstruction": false
+}
+```
+
+**Comparison: Features vs. Reconstructed**
+- **Sparse features** (`use_reconstruction=False`):
+  - Higher dimensional (dict_size = input_dim × expansion_factor)
+  - More interpretable (direct feature activations)
+  - May capture different semantic relationships
+  - Useful for understanding what the SAE learned
+
+- **Reconstructed embeddings** (`use_reconstruction=True`):
+  - Same dimension as base model (input_dim)
+  - Direct replacement for base embeddings
+  - Better for comparing with baseline models
+  - Useful for downstream tasks expecting original embedding size
+
+### Example: Complete Evaluation Workflow
+
+```bash
+# Step 1: Evaluate baseline model
+python evaluation/base_eval.py run \
+    --model="intfloat/multilingual-e5-large" \
+    --results_root="./results_baseline"
+
+# Step 2: Train SAE (see Training section above)
+
+# Step 3: Analyze language features (see Language Feature Analysis section above)
+
+# Step 4: Evaluate SAE with sparse features
+python evaluation/sae_eval.py run_sae_eval \
+    --model="intfloat/multilingual-e5-large" \
+    --sae_path="./checkpoints/.../final_model.pt" \
+    --mask_path="./analysis/.../language_features_combined_mask.pt" \
+    --use_reconstruction=False \
+    --results_root="./results_sae_features"
+
+# Step 5: Evaluate SAE with reconstructed embeddings
+python evaluation/sae_eval.py run_sae_eval \
+    --model="intfloat/multilingual-e5-large" \
+    --sae_path="./checkpoints/.../final_model.pt" \
+    --mask_path="./analysis/.../language_features_combined_mask.pt" \
+    --use_reconstruction=True \
+    --results_root="./results_sae_reconstructed"
+
+# Step 6: Compare results
+# Check NDCG@20, Recall@20, etc. across different configurations
+```
+
+### Supported Models
+
+Both evaluation scripts automatically handle model-specific input formatting:
+- **E5 models**: Adds `"query: "` and `"passage: "` prefixes
+- **Qwen models**: Adds instruction-style prefixes
+- **Jina models**: Adds retrieval-specific prefixes
+- **Other models**: Uses raw text or model-specific formatting
+
+### Tips for Evaluation
+
+1. **Batch Size**: Larger batch sizes (1024-2048) speed up evaluation but require more GPU memory
+2. **Result Caching**: Results are automatically cached - existing results are skipped unless `overwrite=True`
+3. **Multi-Dataset Evaluation**: Use `data_dirs` to evaluate on multiple datasets in one run
+4. **Comparison**: Use consistent `results_root` directories to organize baseline vs. SAE results
+5. **Reconstruction Mode**: Use `use_reconstruction=True` for fair comparison with baseline models (same embedding dimension)
+
 ## Project Structure
 
 ```text
@@ -496,13 +715,17 @@ EncoderSAE/
 │   ├── train.py         # Training loop with multi-GPU support
 │   ├── utils.py         # WandB setup & utilities
 │   ├── main.py          # CLI entry point (training)
-│   ├── analyze.py       # Language feature analysis
-│   ├── analyze_main.py  # CLI entry point (analysis)
-│   └── inference.py     # Language-agnostic inference pipeline
-├── run_main.py          # Wrapper script for multiprocessing compatibility
-├── run_sweep.sh         # Hyperparameter sweep script
-├── pyproject.toml       # Package configuration (uv/pip)
-├── LICENSE              # MIT License
+│   ├── analyze.py        # Language feature analysis
+│   ├── analyze_main.py   # CLI entry point (analysis)
+│   ├── inference.py      # Language-agnostic inference pipeline
+│   └── inference_main.py # CLI entry point (inference)
+├── evaluation/
+│   ├── base_eval.py      # Baseline embedding model evaluation
+│   └── sae_eval.py       # SAE-based language-agnostic evaluation
+├── run_main.py           # Wrapper script for multiprocessing compatibility
+├── run_sweep.sh          # Hyperparameter sweep script
+├── pyproject.toml        # Package configuration (uv/pip)
+├── LICENSE               # MIT License
 └── README.md
 ```
 
