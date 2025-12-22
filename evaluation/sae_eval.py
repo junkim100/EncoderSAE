@@ -22,7 +22,7 @@ from EncoderSAE.inference import remove_language_features
 logger = logging.getLogger(__name__)
 
 
-def load_st_model(model_name: str) -> SentenceTransformer:
+def load_st_model(model_name: str, max_seq_length: int) -> SentenceTransformer:
     """Load SentenceTransformer model with appropriate settings."""
     lower = model_name.lower()
 
@@ -54,7 +54,7 @@ def load_st_model(model_name: str) -> SentenceTransformer:
             tokenizer_kwargs={"fix_mistral_regex": True},
         )
 
-    model.max_seq_length = 512
+    model.max_seq_length = max_seq_length
 
     for module in model.modules():
         if hasattr(module, "config") and hasattr(module.config, "use_cache"):
@@ -274,6 +274,7 @@ def run_sae_eval(
     data_dirs: list[str],
     results_root: str = "./results_sae_eval",
     batch_size: int = 128,
+    max_seq_length: int = 512,
     use_reconstruction: bool = False,
 ) -> None:
     """
@@ -287,6 +288,7 @@ def run_sae_eval(
             queries.jsonl, corpus.jsonl, and qrels.jsonl.
         results_root: Root directory where result JSON files are stored.
         batch_size: Batch size for encoding and SAE processing.
+        max_seq_length: Maximum number of tokens per input sequence (default: 512).
         use_reconstruction: If True, reconstruct to base embedding space;
             otherwise use sparse SAE features directly.
     """
@@ -307,7 +309,7 @@ def run_sae_eval(
 
     try:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        st_model = load_st_model(model)
+        st_model = load_st_model(model, max_seq_length=max_seq_length)
 
         checkpoint = torch.load(sae_path, map_location=device)
         if "model_state_dict" in checkpoint:

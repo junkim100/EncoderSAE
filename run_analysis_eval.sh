@@ -10,9 +10,11 @@ VALIDATION_DATA="${VALIDATION_DATA:-data/4lang_validation.jsonl}"
 MASK_THRESHOLD="${MASK_THRESHOLD:-0.95}"  # Threshold (0.0-1.0) for language-specific feature detection
 
 # Evaluation configuration
-EVAL_DATA_DIRS="${EVAL_DATA_DIRS:-}"  # Comma-separated list of dataset directories (required)
+# Default: all Belebele test subsets under data/Belebele
+EVAL_DATA_DIRS="${EVAL_DATA_DIRS:-data/Belebele/Belebele_test_en,data/Belebele/Belebele_test_de,data/Belebele/Belebele_test_es,data/Belebele/Belebele_test_hi,data/Belebele/Belebele_test_vi,data/Belebele/Belebele_test_zh}"  # Comma-separated list of dataset directories
 RESULTS_ROOT="${RESULTS_ROOT:-./results_sae_eval}"  # Root directory for evaluation results
 BATCH_SIZE="${BATCH_SIZE:-128}"  # Batch size for evaluation
+MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-512}"  # Maximum sequence length for the encoder model
 USE_RECONSTRUCTION="${USE_RECONSTRUCTION:-False}"  # Use reconstructed embeddings instead of sparse features
 
 # GPU configuration
@@ -86,13 +88,14 @@ for i in "${!DIR_ARRAY[@]}"; do
 done
 EVAL_DIRS_PYTHON+="]"
 
-uv run python evaluation/sae_eval.py run_sae_eval \
+uv run python evaluation/sae_eval.py \
     --model="${MODEL_NAME}" \
     --sae_path="${SAE_PATH}" \
     --mask_path="${MASK_PATH}" \
     --data_dirs="${EVAL_DIRS_PYTHON}" \
     --results_root="${RESULTS_ROOT}" \
     --batch_size="${BATCH_SIZE}" \
+    --max_seq_length="${MAX_SEQ_LENGTH}" \
     --use_reconstruction="${USE_RECONSTRUCTION}"
 
 echo ""

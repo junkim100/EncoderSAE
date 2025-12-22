@@ -198,7 +198,10 @@ def add_prefix_to_corpus(
     return corpus
 
 
-def _load_sentence_transformer(model_name: str) -> SentenceTransformer:
+def _load_sentence_transformer(
+    model_name: str,
+    max_seq_length: int,
+) -> SentenceTransformer:
     """Load SentenceTransformer model with appropriate settings."""
     lower = model_name.lower()
 
@@ -230,7 +233,7 @@ def _load_sentence_transformer(model_name: str) -> SentenceTransformer:
             tokenizer_kwargs={"fix_mistral_regex": True},
         )
 
-    model.max_seq_length = 512
+    model.max_seq_length = max_seq_length
 
     if hasattr(model[0], "auto_model") and hasattr(model[0].auto_model, "config"):
         model[0].auto_model.config.use_cache = False
@@ -244,6 +247,7 @@ def run(
     results_root: str = "./results_base",
     batch_size: int = 1024,
     overwrite: bool = False,
+    max_seq_length: int = 512,
 ) -> None:
     """
     Run BEIR-style evaluation for dense embedding models.
@@ -254,6 +258,7 @@ def run(
             queries.jsonl, corpus.jsonl, and qrels.jsonl.
         results_root: Root directory where result JSON files are stored.
         batch_size: Batch size for encoding corpus/queries.
+        max_seq_length: Maximum number of tokens per input sequence (default: 512).
         overwrite: If False, skip datasets for which results already exist.
     """
     logging.basicConfig(
@@ -269,7 +274,7 @@ def run(
     print(f"{'=' * 80}")
 
     try:
-        st_model = _load_sentence_transformer(model)
+        st_model = _load_sentence_transformer(model, max_seq_length=max_seq_length)
         retriever = DenseRetriever(st_model, batch_size=batch_size)
     except Exception as e:
         print(f"[ERROR] Failed to load model '{model}': {e}")

@@ -529,7 +529,8 @@ python evaluation/base_eval.py run \
     --model="Qwen/Qwen3-Embedding-0.6B" \
     --data_dirs='["/path/to/dataset"]' \
     --results_root="./results_base" \
-    --batch_size=1024
+    --batch_size=1024 \
+    --max_seq_length=512
 
 # Evaluate on multiple datasets
 python evaluation/base_eval.py run \
@@ -537,6 +538,7 @@ python evaluation/base_eval.py run \
     --data_dirs='["/path/to/dataset1", "/path/to/dataset2"]' \
     --results_root="./results_base" \
     --batch_size=2048 \
+    --max_seq_length=512 \
     --overwrite=False
 ```
 
@@ -546,6 +548,7 @@ python evaluation/base_eval.py run \
   - Each directory should contain `queries.jsonl`, `corpus.jsonl`, and `qrels.jsonl`
 - `results_root`: Root directory for storing evaluation results (default: `"./results_base"`)
 - `batch_size`: Batch size for encoding queries and corpus (default: `1024`)
+- `max_seq_length`: Maximum number of tokens per input sequence (default: `512`)
 - `overwrite`: If `True`, re-evaluates even when results already exist (default: `False`)
 
 **Dataset Format:**
@@ -581,7 +584,7 @@ Evaluate language-agnostic embeddings created using SAE and language masks. This
 
 ```bash
 # Evaluate SAE embeddings using sparse features (default)
-python evaluation/sae_eval.py run_sae_eval \
+python evaluation/sae_eval.py \
     --model="Alibaba-NLP/gte-multilingual-base" \
     --sae_path="./checkpoints/.../final_model.pt" \
     --mask_path="./analysis/.../language_features_combined_mask.pt" \
@@ -590,7 +593,7 @@ python evaluation/sae_eval.py run_sae_eval \
     --batch_size=128
 
 # Evaluate using reconstructed embeddings (back to base embedding space)
-python evaluation/sae_eval.py run_sae_eval \
+python evaluation/sae_eval.py \
     --model="Alibaba-NLP/gte-multilingual-base" \
     --sae_path="./checkpoints/.../final_model.pt" \
     --mask_path="./analysis/.../language_features_combined_mask.pt" \
@@ -599,7 +602,7 @@ python evaluation/sae_eval.py run_sae_eval \
     --batch_size=128
 
 # Evaluate on multiple custom datasets
-python evaluation/sae_eval.py run_sae_eval \
+python evaluation/sae_eval.py \
     --model="intfloat/multilingual-e5-large" \
     --sae_path="./checkpoints/.../final_model.pt" \
     --mask_path="./analysis/.../language_features_combined_mask.pt" \
