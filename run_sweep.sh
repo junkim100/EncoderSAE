@@ -82,33 +82,25 @@ EOF
         fi
 
         for aux_target in "${TARGETS_TO_TEST[@]}"; do
-          lr_tag=$(printf "%g" "$lr")
-          model_short="${MODEL//\//_}"
+          # Formatting for run/checkpoint naming as requested
+          # Expansion factor: exp32
+          # k as is, e.g., k1024
+          # lr in scientific (i.e., 0.001 -> 1e-03, 0.5 -> 5e-01)
+          # aux/tgt if applicable, otherwise noaux
 
-          aux_tags=$(python - <<EOF
-coeff = ${aux_coeff}
-target = ${aux_target}
+          lr_clean=$(python -c "print(f'{float(${lr}):.0e}' if abs(float(${lr})) < 1e-2 or abs(float(${lr})) > 1 else f'{float(${lr}):.2g}')" | sed 's/+0/+/; s/-0/-/')
+          # But ensure e-03 form for things like 0.001, not 1e-03, not 1e-3. Use three digits in the exponent
+          lr_tag=$(python -c "print('{0:.0e}'.format(float(${lr})).replace('e+0', 'e+').replace('e-0', 'e-'))")
 
-if coeff == 0.0:
-    print("noaux")
-else:
-    if coeff >= 0.001:
-        coeff_tag = f"{int(coeff * 1000)}e3"
-    elif coeff >= 0.0001:
-        coeff_tag = f"{int(coeff * 10000)}e4"
-    else:
-        coeff_tag = f"{coeff:g}"
-
-    if target >= 0.01:
-        target_tag = f"{int(target * 100)}pct"
-    else:
-        target_tag = f"{int(target * 1000)}e3"
-
-    print(f"aux{coeff_tag}_tgt{target_tag}")
-EOF
-)
-
-          run_name="${model_short}_exp${ef}_k${k}_lr${lr_tag}_${aux_tags}"
+          if (( $(echo "${aux_coeff} == 0.0" | bc -l) )); then
+            aux_tag="noaux"
+            run_name="exp${ef}_k${k}_lr${lr_tag}_${aux_tag}"
+          else
+            # Format aux_coeff and aux_target: 0.02 -> 1e-02, 0.5 -> 5e-01, 1.0 -> 1e+00
+            aux_coeff_tag=$(python -c "print('{:.0e}'.format(float(${aux_coeff})).replace('e+0', 'e+').replace('e-0', 'e-'))")
+            aux_target_tag=$(python -c "print('{:.0e}'.format(float(${aux_target})).replace('e+0', 'e+').replace('e-0', 'e-'))")
+            run_name="exp${ef}_k${k}_lr${lr_tag}_aux${aux_coeff_tag}_tgt${aux_target_tag}"
+          fi
 
           echo "==============================================="
           echo "Running EncoderSAE sweep:"
