@@ -9,6 +9,7 @@ TEXT_FILE="${TEXT_FILE:-data/4lang_validation.jsonl}"
 
 # Analysis configuration
 MASK_THRESHOLD="${MASK_THRESHOLD:-0.95}"  # Threshold (0.0-1.0) for language-specific feature detection
+EXCLUDE_OVERLAPPING_FEATURES="${EXCLUDE_OVERLAPPING_FEATURES:-True}"  # Exclude features that are language-specific to multiple languages (default: True)
 
 # Inference configuration
 BATCH_SIZE="${BATCH_SIZE:-32}"           # Batch size for text processing
@@ -57,6 +58,7 @@ uv run -m EncoderSAE.analyze_main \
     --validation_data="${VALIDATION_DATA}" \
     --model="${MODEL_NAME}" \
     --mask_threshold="${MASK_THRESHOLD}" \
+    --exclude_overlapping_features="${EXCLUDE_OVERLAPPING_FEATURES}" \
     --use_vllm \
     --num_gpus="${NUM_GPUS}" \
     --gpu_memory_utilization="${GPU_MEMORY_UTILIZATION}"

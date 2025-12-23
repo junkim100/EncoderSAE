@@ -54,6 +54,7 @@ def analyze_language_features(
     use_vllm: bool = True,
     num_gpus: Optional[int] = None,
     gpu_memory_utilization: float = 0.9,
+    exclude_overlapping_features: bool = True,
 ) -> dict:
     """
     Analyze which SAE features correspond to which languages.
@@ -73,6 +74,9 @@ def analyze_language_features(
         use_vllm: Use vLLM for faster inference
         num_gpus: Number of GPUs to use
         gpu_memory_utilization: GPU memory utilization for vLLM
+        exclude_overlapping_features: If True (default), exclude features that are language-specific to multiple
+            languages from the combined mask. Only features unique to a single language will be masked.
+            If False, include all features that are language-specific in any language (union behavior).
 
     Returns:
         Dictionary mapping language -> analysis results
@@ -172,7 +176,9 @@ def analyze_language_features(
             print(f"Processing {total_samples} samples in batches of {batch_size}...")
             num_batches = (total_samples + batch_size - 1) // batch_size
 
-            for batch_idx in tqdm(range(num_batches), desc="Extracting features", leave=True):
+            for batch_idx in tqdm(
+                range(num_batches), desc="Extracting features", leave=True
+            ):
                 start_idx = batch_idx * batch_size
                 end_idx = min(start_idx + batch_size, total_samples)
                 batch_texts = all_texts[start_idx:end_idx]
@@ -223,9 +229,7 @@ def analyze_language_features(
                                 else:
                                     embedding_data = output.outputs[0]
                                 embedding_tensor = (
-                                    torch.tensor(
-                                        embedding_data, dtype=torch.float32
-                                    )
+                                    torch.tensor(embedding_data, dtype=torch.float32)
                                     if not isinstance(embedding_data, torch.Tensor)
                                     else embedding_data.to(dtype=torch.float32)
                                 )
@@ -250,9 +254,7 @@ def analyze_language_features(
                         )
                     else:
                         try:
-                            embedding_tensor = torch.tensor(
-                                output, dtype=torch.float32
-                            )
+                            embedding_tensor = torch.tensor(output, dtype=torch.float32)
                         except:
                             raise ValueError(
                                 f"Cannot extract embedding from {type(output)}. "
@@ -288,9 +290,9 @@ def analyze_language_features(
                     for i, sample_features in enumerate(features):
                         language = batch_languages[i]
                         # Get top-k active features
-                        active_features = (sample_features > 0).nonzero(
-                            as_tuple=True
-                        )[0]
+                        active_features = (sample_features > 0).nonzero(as_tuple=True)[
+                            0
+                        ]
                         for feat_idx in active_features:
                             language_features[language][feat_idx.item()] += 1
         except ImportError:
@@ -338,9 +340,7 @@ def analyze_language_features(
                 # Count which features fired for each language in this batch
                 for i, sample_features in enumerate(features):
                     language = batch_languages[i]
-                    active_features = (sample_features > 0).nonzero(as_tuple=True)[
-                        0
-                    ]
+                    active_features = (sample_features > 0).nonzero(as_tuple=True)[0]
                     for feat_idx in active_features:
                         language_features[language][feat_idx.item()] += 1
 
@@ -536,23 +536,50 @@ def analyze_language_features(
         f"  These features fire >{mask_threshold * 100:.1f}% for at least one language"
     )
 
-    # Also create a combined union mask
-    # This mask is 1 for ANY feature that is language-specific in ANY language
-    # Use this to remove ALL language-specific features at once
-    combined_mask = torch.zeros(dict_size, dtype=torch.bool)
-    for mask in all_masks.values():
-        combined_mask |= (
-            mask  # Union: 1 if feature is language-specific in any language
+    # Create a combined mask
+    # Option 1: Exclude overlapping features (default) - only features unique to a single language
+    # Option 2: Include all features (union) - features language-specific in any language
+    combined_mask_path_union = output_path / "language_features_combined_mask.pt"
+
+    if exclude_overlapping_features:
+        # Count how many languages each feature appears in
+        feature_language_count = torch.zeros(dict_size, dtype=torch.long)
+        for mask in all_masks.values():
+            feature_language_count += mask.long()
+
+        # Only include features that appear in exactly ONE language mask
+        combined_mask = (feature_language_count == 1).bool()
+
+        # Count overlapping features for reporting
+        overlapping_count = (feature_language_count > 1).sum().item()
+        unique_count = combined_mask.sum().item()
+
+        print(
+            f"\nCombined mask (excluding overlapping features) saved to {combined_mask_path_union}"
+        )
+        print(f"  Unique features (single language only): {unique_count}")
+        print(
+            f"  Overlapping features (multiple languages): {overlapping_count} (excluded)"
+        )
+        print(f"  Total language-specific features: {unique_count + overlapping_count}")
+    else:
+        # Union: include all features that are language-specific in any language
+        combined_mask = torch.zeros(dict_size, dtype=torch.bool)
+        for mask in all_masks.values():
+            combined_mask |= (
+                mask  # Union: 1 if feature is language-specific in any language
+            )
+
+        print(
+            f"\nCombined union mask (including all language-specific features) saved to {combined_mask_path_union}"
+        )
+        print(
+            f"  Contains {combined_mask.sum().item()} features that are language-specific in at least one language"
         )
 
-    combined_mask_path_union = output_path / "language_features_combined_mask.pt"
     torch.save(combined_mask, combined_mask_path_union)
-    print(f"\nCombined union mask saved to {combined_mask_path_union}")
     print(
-        f"  Contains {combined_mask.sum().item()} features that are language-specific in at least one language"
-    )
-    print(
-        f"  Usage: features_agnostic = features * (~combined_mask)  # Remove all language-specific features"
+        f"  Usage: features_agnostic = features * (~combined_mask)  # Remove language-specific features"
     )
 
     print(f"\nAll language masks and indices saved to {output_path}")

@@ -23,6 +23,11 @@ CHECKPOINT_PATHS=(
 # Mask thresholds to test for each checkpoint
 MASK_THRESHOLDS=(0.95 0.98 0.995)
 
+# Whether to exclude overlapping features (features that are language-specific to multiple languages)
+# True (default): Only mask features unique to a single language
+# False: Mask all features that are language-specific in any language (union behavior)
+EXCLUDE_OVERLAPPING_FEATURES="${EXCLUDE_OVERLAPPING_FEATURES:-True}"
+
 # GPU configuration
 # Set NUM_GPUS to the number of GPUs to use (leave empty/unset for auto-detection)
 # You can also set this via environment variable: export NUM_GPUS=2
@@ -134,6 +139,7 @@ for CHECKPOINT_PATH in "${CHECKPOINT_PATHS[@]}"; do
         # Set environment variables and run the analysis script
         export SAE_PATH="${CHECKPOINT_PATH}"
         export MASK_THRESHOLD="${MASK_THRESHOLD}"
+        export EXCLUDE_OVERLAPPING_FEATURES="${EXCLUDE_OVERLAPPING_FEATURES}"
         export NUM_GPUS="${NUM_GPUS}"  # Ensure NUM_GPUS is passed to the analysis script
 
         # Run the analysis script (it will use other defaults or environment variables)

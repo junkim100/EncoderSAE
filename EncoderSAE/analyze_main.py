@@ -21,6 +21,7 @@ def main(
     use_vllm: bool = True,
     num_gpus: int = None,
     gpu_memory_utilization: float = 0.9,
+    exclude_overlapping_features: bool = True,
 ):
     """
     Analyze which SAE features correspond to which languages.
@@ -40,6 +41,9 @@ def main(
         use_vllm: Use vLLM for faster inference (default: True)
         num_gpus: Number of GPUs to use (None = auto-detect all)
         gpu_memory_utilization: GPU memory utilization for vLLM (default: 0.9)
+        exclude_overlapping_features: If True (default), exclude features that are language-specific to multiple
+            languages from the combined mask. Only features unique to a single language will be masked.
+            If False, include all features that are language-specific in any language (union behavior).
     """
     results = analyze_language_features(
         sae_path=sae_path,
@@ -55,6 +59,7 @@ def main(
         use_vllm=use_vllm,
         num_gpus=num_gpus,
         gpu_memory_utilization=gpu_memory_utilization,
+        exclude_overlapping_features=exclude_overlapping_features,
     )
 
     print("\nAnalysis complete!")
