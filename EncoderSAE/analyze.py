@@ -350,6 +350,7 @@ def analyze_language_features(
     print("=" * 60)
 
     results = {}
+    mask_threshold_pct = mask_threshold * 100.0
 
     for language in sorted(language_features.keys()):
         feature_counts = language_features[language]
@@ -360,42 +361,39 @@ def analyze_language_features(
             feature_counts.items(), key=lambda x: x[1], reverse=True
         )
 
-        # Get top features (all if top_k_features is None, otherwise top k)
-        if top_k_features is None:
-            # Show all features
-            top_features = [feat_idx for feat_idx, count in sorted_features]
-            top_features_with_counts = [
-                (feat_idx, count, count / total_samples * 100)
-                for feat_idx, count in sorted_features
-            ]
-        else:
-            # Limit to top k
-            top_features = [
-                feat_idx for feat_idx, count in sorted_features[:top_k_features]
-            ]
-            top_features_with_counts = [
-                (feat_idx, count, count / total_samples * 100)
-                for feat_idx, count in sorted_features[:top_k_features]
-            ]
+        # Filter features by threshold: only include features with percentage >= mask_threshold
+        threshold_features_with_counts = [
+            (feat_idx, count, count / total_samples * 100)
+            for feat_idx, count in sorted_features
+            if (count / total_samples * 100) >= mask_threshold_pct
+        ]
+
+        # Get the feature indices
+        threshold_features = [
+            feat_idx for feat_idx, _, _ in threshold_features_with_counts
+        ]
+
+        # Count how many features meet the threshold
+        num_features_above_threshold = len(threshold_features)
 
         results[language] = {
-            "top_features": top_features,
-            "top_features_detailed": top_features_with_counts,
+            "top_features": threshold_features,
+            "top_features_detailed": threshold_features_with_counts,
             "total_samples": total_samples,
             "unique_features": len(feature_counts),
+            "features_above_threshold": num_features_above_threshold,
+            "threshold_percentage": mask_threshold_pct,
         }
 
         print(
             f"\n{language.upper()} ({total_samples} samples, {len(feature_counts)} unique features):"
         )
-        if top_k_features is None:
-            print(f"  All {len(top_features)} features:")
-            display_count = min(10, len(top_features_with_counts))
-        else:
-            print(f"  Top {top_k_features} features:")
-            display_count = min(10, len(top_features_with_counts))
+        print(
+            f"  Features above threshold ({mask_threshold_pct:.1f}%): {num_features_above_threshold}"
+        )
+        display_count = min(10, len(threshold_features_with_counts))
 
-        for feat_idx, count, pct in top_features_with_counts[:display_count]:
+        for feat_idx, count, pct in threshold_features_with_counts[:display_count]:
             print(
                 f"    Feature {feat_idx:5d}: {count:4d} times ({pct:5.2f}% of samples)"
             )
@@ -415,13 +413,18 @@ def analyze_language_features(
 
         # Combine: model_dataset_exp64_k2048_lr0.001_final or model_dataset_exp64_k2048_lr0.001_step_6000
         if checkpoint_name == "final_model":
-            analysis_dir_name = f"{parent_dir}_final"
+            base_name = f"{parent_dir}_final"
         elif checkpoint_name.startswith("checkpoint_step_"):
             step_num = checkpoint_name.replace("checkpoint_step_", "")
-            analysis_dir_name = f"{parent_dir}_step_{step_num}"
+            base_name = f"{parent_dir}_step_{step_num}"
         else:
             # Fallback: use checkpoint name as-is
-            analysis_dir_name = f"{parent_dir}_{checkpoint_name}"
+            base_name = f"{parent_dir}_{checkpoint_name}"
+
+        # Add mask threshold to directory name
+        # Format: mask0_95 for threshold 0.95, mask0_995 for threshold 0.995
+        mask_str = f"mask{str(mask_threshold).replace('.', '_')}"
+        analysis_dir_name = f"{base_name}_{mask_str}"
 
         output_dir = f"./analysis/{analysis_dir_name}"
 
@@ -439,6 +442,8 @@ def analyze_language_features(
             ],
             "total_samples": res["total_samples"],
             "unique_features": res["unique_features"],
+            "features_above_threshold": res["features_above_threshold"],
+            "threshold_percentage": res["threshold_percentage"],
         }
         for lang, res in results.items()
     }
@@ -450,20 +455,16 @@ def analyze_language_features(
 
     # Generate feature masks for each language
     # Mask: 1 for features that fire above threshold percentage, 0 otherwise
-    # Note: This checks ALL features, not just top_k_features (top_k is only for JSON reporting)
+    # Note: This checks ALL features to generate masks (JSON only includes features above threshold)
     print("\n" + "=" * 60)
     print("Generating Language Feature Masks")
     print("=" * 60)
     print(f"Mask threshold: >{mask_threshold * 100:.1f}% of samples")
     print(f"Dictionary size: {dict_size}")
-    if top_k_features is not None:
-        print(
-            f"Note: All features are checked for masks, not just top {top_k_features} (top_k is for JSON reporting only)"
-        )
-    else:
-        print("Note: All features are included in JSON output and checked for masks")
+    print(
+        f"Note: Only features with percentage >= {mask_threshold_pct:.1f}% are included in JSON output"
+    )
 
-    mask_threshold_pct = mask_threshold * 100.0
     all_masks = {}  # Dictionary to store all language masks
 
     for language in sorted(language_features.keys()):

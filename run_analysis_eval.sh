@@ -46,13 +46,18 @@ PARENT_DIR=$(basename "${SAE_DIR}")
 CHECKPOINT_NAME=$(basename "${SAE_PATH}" .pt)
 
 if [ "${CHECKPOINT_NAME}" = "final_model" ]; then
-    ANALYSIS_DIR_NAME="${PARENT_DIR}_final"
+    BASE_NAME="${PARENT_DIR}_final"
 elif [[ "${CHECKPOINT_NAME}" == checkpoint_step_* ]]; then
     STEP_NUM="${CHECKPOINT_NAME#checkpoint_step_}"
-    ANALYSIS_DIR_NAME="${PARENT_DIR}_step_${STEP_NUM}"
+    BASE_NAME="${PARENT_DIR}_step_${STEP_NUM}"
 else
-    ANALYSIS_DIR_NAME="${PARENT_DIR}_${CHECKPOINT_NAME}"
+    BASE_NAME="${PARENT_DIR}_${CHECKPOINT_NAME}"
 fi
+
+# Add mask threshold to directory name
+# Format: mask0_95 for threshold 0.95, mask0_995 for threshold 0.995
+MASK_STR=$(echo "${MASK_THRESHOLD}" | sed 's/\./_/g')
+ANALYSIS_DIR_NAME="${BASE_NAME}_mask${MASK_STR}"
 
 MASK_PATH="analysis/${ANALYSIS_DIR_NAME}/language_features_combined_mask.pt"
 
