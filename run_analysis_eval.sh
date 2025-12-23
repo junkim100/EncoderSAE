@@ -15,7 +15,7 @@ EVAL_DATA_DIRS="${EVAL_DATA_DIRS:-data/Belebele/Belebele_test_en,data/Belebele/B
 RESULTS_ROOT="${RESULTS_ROOT:-./results_sae_eval}"  # Root directory for evaluation results
 BATCH_SIZE="${BATCH_SIZE:-128}"  # Batch size for evaluation
 MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-512}"  # Maximum sequence length for the encoder model
-USE_RECONSTRUCTION="${USE_RECONSTRUCTION:-False}"  # Use reconstructed embeddings instead of sparse features
+USE_RECONSTRUCTION="${USE_RECONSTRUCTION:-True}"  # Use reconstructed embeddings in the original embedding dimension
 
 # GPU configuration
 NUM_GPUS="${NUM_GPUS:-8}"  # Number of GPUs for vLLM
@@ -96,7 +96,8 @@ uv run python evaluation/sae_eval.py \
     --results_root="${RESULTS_ROOT}" \
     --batch_size="${BATCH_SIZE}" \
     --max_seq_length="${MAX_SEQ_LENGTH}" \
-    --use_reconstruction="${USE_RECONSTRUCTION}"
+    --use_reconstruction="${USE_RECONSTRUCTION}" \
+    --mask_threshold="${MASK_THRESHOLD}"
 
 echo ""
 echo "================================================================================"

@@ -276,6 +276,7 @@ def run_sae_eval(
     batch_size: int = 128,
     max_seq_length: int = 512,
     use_reconstruction: bool = False,
+    mask_threshold: Optional[float] = None,
 ) -> None:
     """
     Evaluate language-agnostic embeddings using SAE and language mask.
@@ -291,6 +292,7 @@ def run_sae_eval(
         max_seq_length: Maximum number of tokens per input sequence (default: 512).
         use_reconstruction: If True, reconstruct to base embedding space;
             otherwise use sparse SAE features directly.
+        mask_threshold: Mask threshold used for generating the language mask (for output directory naming).
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -351,14 +353,34 @@ def run_sae_eval(
         print(f"[ERROR] Failed to load model/SAE: {e}")
         return
 
+    # Extract checkpoint folder name from SAE path
+    # e.g., checkpoints/.../exp32_k1024_lr3e-04_aux1e+00_tgt2e-02/final_model.pt
+    # -> exp32_k1024_lr3e-04_aux1e+00_tgt2e-02
+    sae_path_obj = Path(sae_path)
+    checkpoint_folder_name = sae_path_obj.parent.name  # Get parent directory name
+
+    # If it's just "final_model.pt" or similar, try to get a more descriptive name
+    if checkpoint_folder_name in ["", ".", "checkpoints"] or not checkpoint_folder_name:
+        # Fallback: use the full path but sanitized
+        checkpoint_folder_name = sae_path_obj.stem  # final_model or checkpoint_step_XXX
+
     for data_dir in data_dirs:
         dataset_name = os.path.basename(data_dir.rstrip("/"))
         print(f"\nEvaluating on dataset: {dataset_name}")
 
         model_safe_name = get_safe_model_name(model)
-        sae_safe_name = get_safe_model_name(sae_path)
         mode_name = "reconstructed" if use_reconstruction else "features"
-        output_dir = results_path / f"{model_safe_name}_{sae_safe_name}"
+
+        # Build output directory name with checkpoint folder and mask threshold
+        if mask_threshold is not None:
+            # Format mask threshold: 0.95 -> "mask0_95", 0.995 -> "mask0_995"
+            mask_str = f"mask{str(mask_threshold).replace('.', '_')}"
+            output_dir = (
+                results_path / f"{model_safe_name}_{checkpoint_folder_name}_{mask_str}"
+            )
+        else:
+            output_dir = results_path / f"{model_safe_name}_{checkpoint_folder_name}"
+
         output_dir.mkdir(parents=True, exist_ok=True)
         output_file = output_dir / f"{dataset_name}_{mode_name}_results.json"
 
@@ -418,6 +440,8 @@ def run_sae_eval(
                 "model": model,
                 "sae": sae_path,
                 "mask": mask_path,
+                "mask_threshold": mask_threshold,
+                "checkpoint_folder": checkpoint_folder_name,
                 "dataset": dataset_name,
                 "ndcg": ndcg,
                 "map": _map,
