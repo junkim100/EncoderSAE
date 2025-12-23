@@ -238,7 +238,29 @@ class SAERetriever(BaseSearch):
                 batch = embeddings[i : i + self.batch_size].to(self.device)
 
                 _, features, _, _, _ = self.sae(batch)
+
+                # Debug: Check feature sparsity before masking
+                if i == 0:  # Only log for first batch to avoid spam
+                    active_features_before = (
+                        (features > 0).sum(dim=1).float().mean().item()
+                    )
+                    logger.info(
+                        f"Average active features before masking: {active_features_before:.1f}"
+                    )
+
                 features_agnostic = remove_language_features(features, self.mask)
+
+                # Debug: Check feature sparsity after masking
+                if i == 0:
+                    active_features_after = (
+                        (features_agnostic > 0).sum(dim=1).float().mean().item()
+                    )
+                    logger.info(
+                        f"Average active features after masking: {active_features_after:.1f}"
+                    )
+                    logger.info(
+                        f"Features removed: {active_features_before - active_features_after:.1f} ({((active_features_before - active_features_after) / active_features_before * 100) if active_features_before > 0 else 0:.1f}%)"
+                    )
 
                 if self.use_reconstruction:
                     output = self.sae.decoder(features_agnostic)
@@ -341,6 +363,28 @@ def run_sae_eval(
         mask = torch.load(mask_path, map_location=device)
         if mask.dtype != torch.bool:
             mask = mask.bool()
+
+        # Print mask statistics for debugging
+        total_features = mask.shape[0]
+        masked_features = mask.sum().item()
+        kept_features = (~mask).sum().item()
+        mask_percentage = (masked_features / total_features) * 100.0
+        print(f"\nMask Statistics:")
+        print(f"  Total features: {total_features}")
+        print(
+            f"  Masked (language-specific): {masked_features} ({mask_percentage:.2f}%)"
+        )
+        print(
+            f"  Kept (language-agnostic): {kept_features} ({100.0 - mask_percentage:.2f}%)"
+        )
+        if mask_percentage > 50:
+            print(
+                f"  WARNING: More than 50% of features are masked! This may severely impact performance."
+            )
+        if kept_features < total_features * 0.1:
+            print(
+                f"  WARNING: Less than 10% of features are kept! This will likely cause poor performance."
+            )
 
         retriever_kwargs = {
             "model": st_model,

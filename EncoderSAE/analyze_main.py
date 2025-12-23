@@ -13,7 +13,7 @@ def main(
     validation_data: str = "data/4lang_validation.jsonl",
     text_column: str = "text",
     language_column: str = "language",
-    batch_size: int = 32,
+    batch_size: int = 256,  # Increased default for better GPU utilization
     max_length: int = 512,
     top_k_features: Optional[int] = None,
     mask_threshold: float = 0.8,

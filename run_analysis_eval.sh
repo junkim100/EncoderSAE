@@ -8,12 +8,13 @@ VALIDATION_DATA="${VALIDATION_DATA:-data/4lang_validation.jsonl}"
 
 # Analysis configuration
 MASK_THRESHOLD="${MASK_THRESHOLD:-0.95}"  # Threshold (0.0-1.0) for language-specific feature detection
+ANALYSIS_BATCH_SIZE="${ANALYSIS_BATCH_SIZE:-1024}"  # Batch size for language feature analysis (larger = faster, but uses more GPU memory)
 
 # Evaluation configuration
 # Default: all Belebele test subsets under data/Belebele
 EVAL_DATA_DIRS="${EVAL_DATA_DIRS:-data/Belebele/Belebele_test_en,data/Belebele/Belebele_test_de,data/Belebele/Belebele_test_es,data/Belebele/Belebele_test_hi,data/Belebele/Belebele_test_vi,data/Belebele/Belebele_test_zh}"  # Comma-separated list of dataset directories
 RESULTS_ROOT="${RESULTS_ROOT:-./results_sae_eval}"  # Root directory for evaluation results
-BATCH_SIZE="${BATCH_SIZE:-128}"  # Batch size for evaluation
+BATCH_SIZE="${BATCH_SIZE:-1024}"  # Batch size for evaluation
 MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-512}"  # Maximum sequence length for the encoder model
 USE_RECONSTRUCTION="${USE_RECONSTRUCTION:-True}"  # Use reconstructed embeddings in the original embedding dimension
 
@@ -62,6 +63,7 @@ uv run -m EncoderSAE.analyze_main \
     --validation_data="${VALIDATION_DATA}" \
     --model="${MODEL_NAME}" \
     --mask_threshold="${MASK_THRESHOLD}" \
+    --batch_size="${ANALYSIS_BATCH_SIZE}" \
     --use_vllm \
     --num_gpus="${NUM_GPUS}" \
     --gpu_memory_utilization="${GPU_MEMORY_UTILIZATION}"
