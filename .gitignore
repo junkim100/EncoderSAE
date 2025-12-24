@@ -29,7 +29,7 @@ activations/
 checkpoints/
 *.pt
 wandb/
-data/
+data/**/*.jsonl
 cache/
 analysis/
 
