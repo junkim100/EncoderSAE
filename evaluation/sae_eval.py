@@ -115,7 +115,10 @@ def process_embeddings(
     Args:
         runtime: SAERuntime instance
         embeddings: [N, D] tensor of base embeddings
-        mask: Boolean mask of shape [dict_size] where True means mask (remove) feature
+        mask: Boolean mask of shape [dict_size] where True means disable (zero out) feature.
+            Features where mask[i] = True fired in >= threshold% of samples (e.g., >=99% for threshold=0.99)
+            and will be zeroed out to create language-agnostic embeddings.
+            Example: If mask_threshold=0.99, features that activated in >=99% of language samples are marked True.
         use_reconstruction: If True, return reconstructed embeddings; if False, return masked features
         batch_size: Batch size for processing
 
@@ -133,15 +136,20 @@ def process_embeddings(
             batch = embeddings[i : i + batch_size].to(runtime.device)
 
             # SAE Forward with mask
+            # Returns: x_hat_orig (unmasked reconstruction), z (unmasked features), x_hat_masked (masked reconstruction)
             x_hat_orig, z, x_hat_masked = runtime.forward(batch, mask=mask)
 
             if use_reconstruction:
+                # Use the masked reconstruction (language-agnostic embeddings)
                 res = x_hat_masked
             else:
-                # Return masked features (latent space)
+                # Return masked features (latent space) instead of reconstruction
                 if mask is not None:
+                    # Apply mask to features: zero out features where mask[i] = True
+                    # This disables SAE neurons (features) that fired in >= threshold% of language samples
+                    # Use explicit multiplication to ensure correct column selection
                     z_masked = z.clone()
-                    z_masked[:, mask] = 0
+                    z_masked = z_masked * (~mask).float().unsqueeze(0)  # Zero out language-specific features
                     res = z_masked
                 else:
                     res = z
@@ -173,6 +181,10 @@ def main():
     checkpoint_folder_name = ckpt_dir.name
 
     # 3. Load Mask
+    # Mask semantics: mask[i] = True means feature i fired in >= threshold% of samples for a language
+    # These features (SAE neurons) will be zeroed out (disabled) to create language-agnostic embeddings
+    # Example: If mask_threshold=0.99, features that activated in >=99% of language samples are marked True
+    # During inference: z_masked[:, mask] = 0 zeros out these language-specific features
     mask = None
     if args.mask_path:
         logger.info(f"Loading Mask from {args.mask_path}")
@@ -183,7 +195,10 @@ def main():
         total = mask.numel()
         masked_cnt = mask.sum().item()
         logger.info(
-            f"Mask Stats: {masked_cnt}/{total} ({(masked_cnt/total)*100:.2f}%) features masked"
+            f"Mask Stats: {masked_cnt}/{total} ({(masked_cnt/total)*100:.2f}%) features will be disabled"
+        )
+        logger.info(
+            f"  These features fired in >= threshold% of language samples and will be zeroed out"
         )
 
     # 4. Process Datasets

@@ -100,13 +100,16 @@ class SAERuntime:
 
         Args:
             x: Input embeddings [N, D]
-            mask: Boolean mask of shape [dict_size] where True means mask (remove) feature
+            mask: Boolean mask of shape [dict_size] where True means disable (zero out) feature.
+                Features where mask[i] = True fired in >= threshold% of samples for a language
+                and will be zeroed out to create language-agnostic embeddings.
+                Example: If mask_threshold=0.99, features that fire in >=99% of samples are marked True.
             disable_mask: If True, ignore mask even if provided
 
         Returns:
-            x_hat_orig: Original reconstruction without masking
-            z: Sparse features [N, dict_size]
-            x_hat_masked: Reconstruction after masking language-specific features
+            x_hat_orig: Original reconstruction without masking [N, D]
+            z: Sparse features [N, dict_size] (unmasked, original activations)
+            x_hat_masked: Reconstruction after masking language-specific features [N, D]
         """
         x = x.to(self.device)
 
@@ -116,10 +119,15 @@ class SAERuntime:
 
             if mask is not None and not disable_mask:
                 mask = mask.to(self.device)
-                # Apply mask: zero out masked features
+                # Apply mask: zero out features where mask[i] = True
+                # This disables language-specific features (neurons) that fired in >= threshold% of samples
+                # mask[i] = True means feature i should be disabled (zeroed out)
+                # Use explicit indexing to ensure correct column selection
                 z_masked = z.clone()
-                z_masked[:, mask] = 0
-                # Decode masked features
+                # Zero out features where mask is True: multiply by inverse of mask
+                # This correctly zeros out columns (features) for all samples
+                z_masked = z_masked * (~mask).float().unsqueeze(0)  # [N, dict_size] * [1, dict_size]
+                # Decode masked features to get language-agnostic embeddings
                 x_hat_masked = self.model.decoder(z_masked)
             else:
                 x_hat_masked = x_hat_orig

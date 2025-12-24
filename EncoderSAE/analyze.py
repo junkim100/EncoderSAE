@@ -65,7 +65,8 @@ def analyze_language_features(
         validation_data: Path to validation JSONL file with language labels
         text_column: Name of text column in validation data
         language_column: Name of language column in validation data
-        batch_size: Batch size for processing
+        batch_size: Batch size for SAE processing (vLLM processes all texts at once internally).
+            This parameter mainly affects GPU memory usage during SAE feature extraction, not vLLM encoding speed.
         max_length: Maximum sequence length
         top_k_features: Number of top features to report per language in JSON (None = show all features, for reporting only, does not affect masks)
         mask_threshold: Percentage threshold (0.0-1.0) for mask generation. Features firing above this threshold
@@ -172,27 +173,37 @@ def analyze_language_features(
                 disable_log_stats=True,  # Disable vLLM's internal progress stats
             )
 
-            # Process all texts together in batches (much faster than per-language)
-            print(f"Processing {total_samples} samples in batches of {batch_size}...")
-            num_batches = (total_samples + batch_size - 1) // batch_size
+            # Process all texts together - vLLM handles batching internally efficiently
+            # Note: batch_size parameter doesn't significantly affect vLLM's internal processing
+            # vLLM's encode() method processes requests efficiently regardless of input batch size
+            print(f"Processing {total_samples} samples with vLLM (internal batching)...")
 
-            for batch_idx in tqdm(
-                range(num_batches), desc="Extracting features", leave=True
-            ):
-                start_idx = batch_idx * batch_size
-                end_idx = min(start_idx + batch_size, total_samples)
-                batch_texts = all_texts[start_idx:end_idx]
-                batch_languages = text_to_language[start_idx:end_idx]
-
-                # Get embeddings from vLLM using encode() API
-                # Suppress vLLM's internal progress bars ("Adding requests", "Processed prompts")
-                # by redirecting stdout/stderr during the encode call
-                try:
-                    with suppress_output():
-                        outputs = llm.encode(
-                            batch_texts, pooling_task="embed", use_tqdm=False
-                        )
-                except Exception as e:
+            # Pass all texts at once - vLLM will handle batching internally for optimal GPU utilization
+            # This is more efficient than manual batching since vLLM can optimize its internal scheduling
+            try:
+                with suppress_output():
+                    outputs = llm.encode(
+                        all_texts, pooling_task="embed", use_tqdm=False
+                    )
+            except Exception as e:
+                # If memory error, fall back to batched processing
+                if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
+                    print(f"Memory error with full batch, falling back to batched processing (batch_size={batch_size})...")
+                    num_batches = (total_samples + batch_size - 1) // batch_size
+                    all_outputs = []
+                    for batch_idx in tqdm(
+                        range(num_batches), desc="Extracting features", leave=True
+                    ):
+                        start_idx = batch_idx * batch_size
+                        end_idx = min(start_idx + batch_size, total_samples)
+                        batch_texts = all_texts[start_idx:end_idx]
+                        with suppress_output():
+                            batch_outputs = llm.encode(
+                                batch_texts, pooling_task="embed", use_tqdm=False
+                            )
+                        all_outputs.extend(batch_outputs)
+                    outputs = all_outputs
+                else:
                     # Re-raise with original stdout/stderr restored so error is visible
                     print(f"Error during vLLM encode: {e}", file=sys.stderr)
                     raise
@@ -278,23 +289,33 @@ def analyze_language_features(
                     embedding_tensors.append(embedding_tensor)
 
                 # Stack into batch tensor
-                batch_activations = torch.stack(embedding_tensors)
+                all_activations = torch.stack(embedding_tensors)
+                all_activations = all_activations.to(device)
 
-                batch_activations = batch_activations.to(device)
+                # Process through SAE in batches to avoid memory issues
+                # Use batch_size for SAE processing (this actually matters for GPU memory)
+                sae_batch_size = batch_size if batch_size > 0 else 1024
+                num_sae_batches = (len(all_activations) + sae_batch_size - 1) // sae_batch_size
 
-                # Pass through SAE to get features
-                with torch.no_grad():
-                    _, features, _, _, _ = sae(batch_activations)
+                for sae_batch_idx in range(num_sae_batches):
+                    sae_start_idx = sae_batch_idx * sae_batch_size
+                    sae_end_idx = min(sae_start_idx + sae_batch_size, len(all_activations))
+                    batch_activations = all_activations[sae_start_idx:sae_end_idx]
+                    batch_languages_chunk = text_to_language[sae_start_idx:sae_end_idx]
 
-                    # Count which features fired for each language in this batch
-                    for i, sample_features in enumerate(features):
-                        language = batch_languages[i]
-                        # Get top-k active features
-                        active_features = (sample_features > 0).nonzero(as_tuple=True)[
-                            0
-                        ]
-                        for feat_idx in active_features:
-                            language_features[language][feat_idx.item()] += 1
+                    # Pass through SAE to get features
+                    with torch.no_grad():
+                        _, features, _, _, _ = sae(batch_activations)
+
+                        # Count which features fired for each language in this batch
+                        for i, sample_features in enumerate(features):
+                            language = batch_languages_chunk[i]
+                            # Get top-k active features
+                            active_features = (sample_features > 0).nonzero(as_tuple=True)[
+                                0
+                            ]
+                            for feat_idx in active_features:
+                                language_features[language][feat_idx.item()] += 1
         except ImportError:
             print("vLLM not available, falling back to HuggingFace")
             use_vllm = False
@@ -454,21 +475,24 @@ def analyze_language_features(
     print(f"\nResults saved to {json_path}")
 
     # Generate feature masks for each language
-    # Mask: 1 for features that fire above threshold percentage, 0 otherwise
-    # Note: This checks ALL features to generate masks (JSON only includes features above threshold)
+    # Mask semantics: mask[i] = True means feature i fires in >= threshold% of samples for this language
+    # When used in evaluation: features where mask[i] = True are zeroed out (disabled)
+    # This removes language-specific features to create language-agnostic embeddings
     print("\n" + "=" * 60)
     print("Generating Language Feature Masks")
     print("=" * 60)
-    print(f"Mask threshold: >{mask_threshold * 100:.1f}% of samples")
+    print(f"Mask threshold: >= {mask_threshold * 100:.1f}% of samples")
     print(f"Dictionary size: {dict_size}")
     print(
-        f"Note: Only features with percentage >= {mask_threshold_pct:.1f}% are included in JSON output"
+        f"Note: Features firing in >= {mask_threshold_pct:.1f}% of samples will be masked (disabled)"
     )
 
     all_masks = {}  # Dictionary to store all language masks
 
     for language in sorted(language_features.keys()):
-        # Create mask tensor: 1 for features with >50% usage, 0 otherwise
+        # Create mask tensor: True for features that fire >= threshold% of samples
+        # mask[i] = True means feature i should be disabled (zeroed out) during inference
+        # Example: If mask_threshold=0.99 (99%), features firing in >=99% of samples are marked True
         mask = torch.zeros(dict_size, dtype=torch.bool)
 
         # Get all feature counts for this language (not just top_k)
@@ -477,17 +501,30 @@ def analyze_language_features(
 
         # Check ALL features (not just top_k_features) and filter by percentage threshold
         # This ensures we capture all language-specific features, regardless of how many exist
+        #
+        # IMPORTANT: "Activation percentage" here means FREQUENCY (how often a feature fires),
+        # NOT the activation value magnitude. A feature is considered language-specific if it
+        # fires (activation > 0) in >= threshold% of samples for that language.
+        #
+        # Example: If mask_threshold=0.99 (99%), features that fire in >=99% of samples are masked.
+        # This identifies features that are consistently active for a language, regardless of
+        # their activation value magnitude.
+        #
+        # count = number of samples where this feature had activation > 0 (fired)
+        # percentage = (count / total_samples) * 100.0 = frequency percentage
         for feat_idx, count in feature_counts.items():
             percentage = (count / total_samples) * 100.0
-            if percentage > mask_threshold_pct:
-                mask[feat_idx] = 1
+            # Use >= to include features at exactly threshold (e.g., exactly 99% for threshold 0.99)
+            # mask_threshold_pct is already converted from decimal (0.99) to percentage (99.0)
+            if percentage >= mask_threshold_pct:
+                mask[feat_idx] = True  # Mark this feature for masking (disabling)
 
-        # Count how many features are enabled for this language
+        # Count how many features are marked for masking (disabling) for this language
         num_enabled = mask.sum().item()
 
         print(
-            f"\n{language.upper()}: {num_enabled} features enabled "
-            f"(>{mask_threshold_pct}% of {total_samples} samples)"
+            f"\n{language.upper()}: {num_enabled} features marked for masking "
+            f"(>= {mask_threshold_pct:.1f}% of {total_samples} samples)"
         )
 
         # Store in combined dictionary (individual files not saved - use per_language_masks.pt instead)
@@ -538,8 +575,10 @@ def analyze_language_features(
     )
 
     # Create a combined mask
+    # Combined mask semantics: mask[i] = True means feature i should be disabled (zeroed out)
     # Option 1: Exclude overlapping features (default) - only features unique to a single language
     # Option 2: Include all features (union) - features language-specific in any language
+    # When applied: z_masked[:, mask] = 0 zeros out features where mask is True
     combined_mask_path_union = output_path / "language_features_combined_mask.pt"
 
     if exclude_overlapping_features:

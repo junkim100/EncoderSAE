@@ -32,7 +32,9 @@ def main(
         validation_data: Path to validation JSONL file with language labels
         text_column: Name of text column in validation data (default: "text")
         language_column: Name of language column in validation data (default: "language")
-        batch_size: Batch size for processing (default: 32)
+        batch_size: Batch size for SAE processing (default: 256).
+            Note: vLLM processes all texts at once internally, so this mainly affects GPU memory
+            during SAE feature extraction, not vLLM encoding speed.
         max_length: Maximum sequence length (default: 512)
         top_k_features: Number of top features to report per language in JSON (default: None = show all features, for reporting only, does not affect masks)
         mask_threshold: Percentage threshold (0.0-1.0) for mask generation (default: 0.8 = 80%).
