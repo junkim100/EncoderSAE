@@ -1,510 +1,345 @@
+"""Standalone SAE Evaluation (vLLM Optimized) - Rewritten from scratch."""
+import argparse
 import json
 import logging
-import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Dict, Any, List
 
-import fire
 import torch
-from beir.retrieval.evaluation import EvaluateRetrieval
-from beir.retrieval.search.base import BaseSearch
-from sentence_transformers import SentenceTransformer
-from sentence_transformers.util import cos_sim
+import torch.nn.functional as F
+import numpy as np
+from tqdm import tqdm
 
+# Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from EncoderSAE.model import EncoderSAE
-from EncoderSAE.inference import remove_language_features
+from .sae_runtime import SAERuntime
+from .utils import run_base_encoding, get_e5_query_prefix, get_e5_passage_prefix
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
-def load_st_model(model_name: str, max_seq_length: int) -> SentenceTransformer:
-    """Load SentenceTransformer model with appropriate settings."""
-    lower = model_name.lower()
-
-    if "gte" in lower:
-        model = SentenceTransformer(
-            model_name,
-            trust_remote_code=True,
-            tokenizer_kwargs={"fix_mistral_regex": True},
-        )
-        if "qwen" in lower:
-            model = SentenceTransformer(
-                model_name,
-                trust_remote_code=True,
-                model_kwargs={"dtype": torch.bfloat16},
-            )
-    elif "jina" in lower or "llama-nemotron-embed" in lower:
-        model = SentenceTransformer(
-            model_name,
-            trust_remote_code=True,
-            model_kwargs={"dtype": torch.bfloat16},
-        )
-    elif "qwen" in lower:
-        model = SentenceTransformer(model_name, model_kwargs={"dtype": torch.bfloat16})
-    elif "mxbai" in lower:
-        model = SentenceTransformer(model_name, model_kwargs={"dtype": torch.float16})
-    else:
-        model = SentenceTransformer(
-            model_name,
-            tokenizer_kwargs={"fix_mistral_regex": True},
-        )
-
-    model.max_seq_length = max_seq_length
-
-    for module in model.modules():
-        if hasattr(module, "config") and hasattr(module.config, "use_cache"):
-            module.config.use_cache = False
-
-    return model
-
-
-def get_safe_model_name(model_name: str) -> str:
-    """Generate filesystem-safe model name."""
-    name = model_name.rstrip("/")
-    if os.path.exists(name):
-        name = os.path.basename(name)
-    return name.replace("/", "_").replace(" ", "_")
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="Standalone SAE Evaluation (vLLM Optimized)")
+    parser.add_argument(
+        "--model",
+        type=str,
+        required=True,
+        help="Base model name (e.g. intfloat/multilingual-e5-large)",
+    )
+    parser.add_argument("--sae_path", type=str, required=True, help="Path to SAE checkpoint directory")
+    parser.add_argument(
+        "--mask_path", type=str, default=None, help="Path to mask file (.pt)"
+    )
+    parser.add_argument(
+        "--data_dirs",
+        type=str,
+        required=True,
+        help="Comma separated list of data directories (or Python list format)",
+    )
+    parser.add_argument(
+        "--max_seq_length",
+        type=int,
+        default=512,
+        help="Maximum sequence length (for compatibility, not used in vLLM path)",
+    )
+    parser.add_argument("--results_root", type=str, required=True, help="Output directory")
+    parser.add_argument(
+        "--use_reconstruction",
+        type=str,
+        default="True",
+        help="If 'True', use SAE decoder output. If 'False', use latent features.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=4096,
+        help="Batch size for SAE processing",
+    )
+    parser.add_argument(
+        "--mask_threshold",
+        type=float,
+        default=None,
+        help="Mask threshold used (for output directory naming)",
+    )
+    return parser.parse_args()
 
 
-def add_prefix_to_queries(queries: Dict[str, str], model_name: str) -> Dict[str, str]:
-    """Add model-specific prefix to queries."""
-    lower = model_name.lower()
-    if "e5" in lower or "snowflake-arctic-embed" in lower:
-        return {qid: f"query: {query}" for qid, query in queries.items()}
-    if "qwen" in lower or "gte-qwen" in lower:
-        return {
-            qid: (
-                "Instruct: Given a web search query, retrieve relevant passages that answer the query\n"
-                f"Query: {query}"
-            )
-            for qid, query in queries.items()
-        }
-    if "jina" in lower:
-        return {
-            qid: f"Represent the query for retrieving evidence documents: {query}"
-            for qid, query in queries.items()
-        }
-    if "embeddinggemma" in lower:
-        return {
-            qid: f"task: search result | query: {query}"
-            for qid, query in queries.items()
-        }
-    if model_name == "nvidia/llama-nemotron-embed-1b-v2":
-        return {qid: f"query: {query}" for qid, query in queries.items()}
-    if "mxbai" in lower:
-        return {
-            qid: f"Represent this sentence for searching relevant passages: {query}"
-            for qid, query in queries.items()
-        }
-    return queries
-
-
-def add_prefix_to_corpus(
-    corpus: Dict[str, Dict[str, Any]],
-    model_name: str,
-) -> Dict[str, Dict[str, Any]]:
-    """Add model-specific prefix to corpus texts while preserving other fields."""
-    lower = model_name.lower()
-    new_corpus: Dict[str, Dict[str, Any]] = {}
-
-    for doc_id, doc in corpus.items():
-        new_doc = dict(doc)
-        text = doc.get("text", "")
-
-        if "e5" in lower:
-            new_doc["text"] = f"passage: {text}"
-        elif "jina" in lower:
-            new_doc["text"] = f"Represent the document for retrieval: {text}"
-        elif "embeddinggemma" in lower:
-            new_doc["text"] = f"title: none | text: {text}"
-        elif model_name == "nvidia/llama-nemotron-embed-1b-v2":
-            new_doc["text"] = f"passage: {text}"
-        else:
-            new_doc["text"] = text
-
-        new_corpus[doc_id] = new_doc
-
-    return new_corpus
-
-
-class SAERetriever(BaseSearch):
-    """Retriever that uses SAE and language mask for language-agnostic embeddings."""
-
-    def __init__(
-        self,
-        model: SentenceTransformer,
-        sae: EncoderSAE,
-        mask: torch.Tensor,
-        batch_size: int = 128,
-        corpus_chunk_size: int = 50000,
-        use_reconstruction: bool = False,
-        **kwargs,
-    ) -> None:
-        self.model = model
-        self.sae = sae
-        self.mask = mask
-        self.batch_size = batch_size
-        self.corpus_chunk_size = corpus_chunk_size
-        self.use_reconstruction = use_reconstruction
-        self.show_progress_bar = kwargs.get("show_progress_bar", True)
-        self.results: Dict[str, Dict[str, float]] = {}
-
-        if torch.cuda.is_available():
-            self.device = "cuda"
-            num_gpus = torch.cuda.device_count()
-            logger.info(f"Using CUDA with {num_gpus} visible GPU(s) for encoding.")
-        else:
-            self.device = "cpu"
-            logger.info("CUDA not available; using CPU for encoding.")
-
-        self.sae.to(self.device)
-        self.sae.eval()
-        self.mask = self.mask.to(self.device)
-
-    def search(
-        self,
-        corpus: Dict[str, Dict[str, Any]],
-        queries: Dict[str, str],
-        top_k: int,
-        score_function: str = "cos_sim",
-        **kwargs,
-    ) -> Dict[str, Dict[str, float]]:
-        """Search corpus for queries and return top_k results."""
-        logger.info("Encoding queries...")
-        query_ids = list(queries.keys())
-        query_texts = [queries[qid] for qid in query_ids]
-
-        query_embeddings = self.model.encode(
-            query_texts,
-            batch_size=self.batch_size,
-            show_progress_bar=self.show_progress_bar,
-            convert_to_tensor=True,
-            device=self.device,
-        )
-
-        query_embeddings = self.apply_sae_transformation(query_embeddings)
-
-        logger.info("Encoding corpus...")
-        corpus_ids = list(corpus.keys())
-        corpus_texts = []
-        for cid in corpus_ids:
-            doc = corpus[cid]
-            title = doc.get("title", "")
-            text = doc.get("text", "")
-            if title:
-                corpus_texts.append(f"{title} {text}".strip())
-            else:
-                corpus_texts.append(text.strip())
-
-        corpus_embeddings = self.model.encode(
-            corpus_texts,
-            batch_size=self.batch_size,
-            show_progress_bar=self.show_progress_bar,
-            convert_to_tensor=True,
-            device=self.device,
-        )
-
-        corpus_embeddings = self.apply_sae_transformation(corpus_embeddings)
-
-        logger.info("Computing similarities...")
-        cos_scores = cos_sim(query_embeddings, corpus_embeddings)
-
-        self.results = {}
-        for idx, qid in enumerate(query_ids):
-            scores = cos_scores[idx]
-            top_results = torch.topk(scores, k=min(top_k, len(corpus_ids)))
-
-            self.results[qid] = {}
-            for score, corpus_idx in zip(
-                top_results.values.tolist(), top_results.indices.tolist()
-            ):
-                corpus_id = corpus_ids[corpus_idx]
-                if corpus_id != qid:
-                    self.results[qid][corpus_id] = float(score)
-
-        return self.results
-
-    def apply_sae_transformation(self, embeddings: torch.Tensor) -> torch.Tensor:
-        """Process embeddings through SAE and apply language mask."""
-        transformed_list = []
-
-        with torch.no_grad():
-            for i in range(0, len(embeddings), self.batch_size):
-                batch = embeddings[i : i + self.batch_size].to(self.device)
-
-                _, features, _, _, _ = self.sae(batch)
-
-                # Debug: Check feature sparsity before masking
-                if i == 0:  # Only log for first batch to avoid spam
-                    active_features_before = (
-                        (features > 0).sum(dim=1).float().mean().item()
-                    )
-                    logger.info(
-                        f"Average active features before masking: {active_features_before:.1f}"
-                    )
-
-                features_agnostic = remove_language_features(features, self.mask)
-
-                # Debug: Check feature sparsity after masking
-                if i == 0:
-                    active_features_after = (
-                        (features_agnostic > 0).sum(dim=1).float().mean().item()
-                    )
-                    logger.info(
-                        f"Average active features after masking: {active_features_after:.1f}"
-                    )
-                    logger.info(
-                        f"Features removed: {active_features_before - active_features_after:.1f} ({((active_features_before - active_features_after) / active_features_before * 100) if active_features_before > 0 else 0:.1f}%)"
-                    )
-
-                if self.use_reconstruction:
-                    output = self.sae.decoder(features_agnostic)
-                else:
-                    output = features_agnostic
-
-                transformed_list.append(output)
-
-        return torch.cat(transformed_list, dim=0)
-
-    def encode(
-        self,
-        corpus,
-        queries,
-        encode_output_path="./embeddings/",
-        overwrite=False,
-        query_filename="queries.pkl",
-        corpus_filename="corpus.*.pkl",
-        **kwargs,
-    ):
-        raise NotImplementedError("encode method not implemented")
-
-    def search_from_files(
-        self, query_embeddings_file, corpus_embeddings_files, top_k, **kwargs
-    ):
-        raise NotImplementedError("search_from_files method not implemented")
-
-
-def run_sae_eval(
-    model: str,
-    sae_path: str,
-    mask_path: str,
-    data_dirs: list[str],
-    results_root: str = "./results_sae_eval",
-    batch_size: int = 128,
-    max_seq_length: int = 512,
-    use_reconstruction: bool = False,
-    mask_threshold: Optional[float] = None,
-) -> None:
+def compute_metrics(qrels: Dict[str, Dict[str, int]], results: Dict[str, Dict[str, float]], k_values: List[int] = [1, 3, 5, 10, 20, 100, 1000]):
     """
-    Evaluate language-agnostic embeddings using SAE and language mask.
+    Compute NDCG, Recall, MAP, Precision etc.
+    Uses BEIR's evaluation framework.
+    """
+    try:
+        from beir.retrieval.evaluation import EvaluateRetrieval
+
+        class MockRetriever:
+            def __init__(self):
+                pass
+
+        evaluator = EvaluateRetrieval(retriever=MockRetriever())
+        return evaluator.evaluate(qrels, results, k_values)
+
+    except ImportError:
+        logger.error("BEIR not installed. Cannot compute metrics.")
+        return {}, {}, {}, {}
+
+
+def process_embeddings(
+    runtime: SAERuntime,
+    embeddings: torch.Tensor,
+    mask: torch.Tensor,
+    use_reconstruction: bool = True,
+    batch_size: int = 4096,
+) -> torch.Tensor:
+    """
+    Apply SAE -> Mask -> (Optional) Reconstruction to a batch of embeddings.
 
     Args:
-        model: Base model name (must match model used for SAE training).
-        sae_path: Path to trained SAE checkpoint (.pt file).
-        mask_path: Path to language mask file (.pt file).
-        data_dirs: List of dataset directory paths. Each directory must contain
-            queries.jsonl, corpus.jsonl, and qrels.jsonl.
-        results_root: Root directory where result JSON files are stored.
-        batch_size: Batch size for encoding and SAE processing.
-        max_seq_length: Maximum number of tokens per input sequence (default: 512).
-        use_reconstruction: If True, reconstruct to base embedding space;
-            otherwise use sparse SAE features directly.
-        mask_threshold: Mask threshold used for generating the language mask (for output directory naming).
+        runtime: SAERuntime instance
+        embeddings: [N, D] tensor of base embeddings
+        mask: Boolean mask of shape [dict_size] where True means mask (remove) feature
+        use_reconstruction: If True, return reconstructed embeddings; if False, return masked features
+        batch_size: Batch size for processing
+
+    Returns:
+        Processed embeddings: [N, D] tensor (if reconstruction) or [N, S] (if latent)
     """
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-    )
+    runtime.model.to(runtime.device)
+    if mask is not None:
+        mask = mask.to(runtime.device)
 
-    results_path = Path(results_root)
-    results_path.mkdir(parents=True, exist_ok=True)
+    results = []
 
-    print(f"\n{'='*80}")
-    print(f"Evaluating model: {model}")
-    print(f"Using SAE: {sae_path}")
-    print(f"Using Mask: {mask_path}")
-    print(f"Reconstruction: {use_reconstruction}")
-    print(f"{'='*80}")
+    with torch.no_grad():
+        for i in range(0, len(embeddings), batch_size):
+            batch = embeddings[i : i + batch_size].to(runtime.device)
 
-    try:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        st_model = load_st_model(model, max_seq_length=max_seq_length)
+            # SAE Forward with mask
+            x_hat_orig, z, x_hat_masked = runtime.forward(batch, mask=mask)
 
-        checkpoint = torch.load(sae_path, map_location=device)
-        if "model_state_dict" in checkpoint:
-            state_dict = checkpoint["model_state_dict"]
-        elif isinstance(checkpoint, dict) and "encoder.weight" in checkpoint:
-            state_dict = checkpoint
-        else:
-            raise ValueError(f"Could not parse checkpoint format from {sae_path}")
+            if use_reconstruction:
+                res = x_hat_masked
+            else:
+                # Return masked features (latent space)
+                if mask is not None:
+                    z_masked = z.clone()
+                    z_masked[:, mask] = 0
+                    res = z_masked
+                else:
+                    res = z
 
-        encoder_weight = state_dict["encoder.weight"]
-        input_dim = encoder_weight.shape[1]
-        dict_size = encoder_weight.shape[0]
-        expansion_factor = dict_size // input_dim
-        sparsity = (
-            checkpoint.get("sparsity", 64) if isinstance(checkpoint, dict) else 64
-        )
+            results.append(res.cpu())
 
-        sae = EncoderSAE(
-            input_dim=input_dim,
-            expansion_factor=expansion_factor,
-            sparsity=sparsity,
-        )
-        sae.load_state_dict(state_dict)
-        sae.to(device)
-        sae.eval()
+    return torch.cat(results, dim=0)
 
-        mask = torch.load(mask_path, map_location=device)
+
+def main():
+    """Main evaluation function."""
+    args = parse_args()
+
+    # 1. Setup Output Dir
+    out_dir = Path(args.results_root)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 2. Load SAE Runtime
+    logger.info(f"Loading SAE from {args.sae_path}")
+    sae_path_obj = Path(args.sae_path)
+    if sae_path_obj.is_file():
+        ckpt_dir = sae_path_obj.parent
+    else:
+        ckpt_dir = sae_path_obj
+
+    runtime = SAERuntime(str(ckpt_dir))
+
+    # Extract checkpoint folder name for output directory naming
+    checkpoint_folder_name = ckpt_dir.name
+
+    # 3. Load Mask
+    mask = None
+    if args.mask_path:
+        logger.info(f"Loading Mask from {args.mask_path}")
+        mask = torch.load(args.mask_path, map_location="cpu")
         if mask.dtype != torch.bool:
             mask = mask.bool()
-
-        # Print mask statistics for debugging
-        total_features = mask.shape[0]
-        masked_features = mask.sum().item()
-        kept_features = (~mask).sum().item()
-        mask_percentage = (masked_features / total_features) * 100.0
-        print(f"\nMask Statistics:")
-        print(f"  Total features: {total_features}")
-        print(
-            f"  Masked (language-specific): {masked_features} ({mask_percentage:.2f}%)"
+        # Mask Stats
+        total = mask.numel()
+        masked_cnt = mask.sum().item()
+        logger.info(
+            f"Mask Stats: {masked_cnt}/{total} ({(masked_cnt/total)*100:.2f}%) features masked"
         )
-        print(
-            f"  Kept (language-agnostic): {kept_features} ({100.0 - mask_percentage:.2f}%)"
-        )
-        if mask_percentage > 50:
-            print(
-                f"  WARNING: More than 50% of features are masked! This may severely impact performance."
-            )
-        if kept_features < total_features * 0.1:
-            print(
-                f"  WARNING: Less than 10% of features are kept! This will likely cause poor performance."
-            )
 
-        retriever_kwargs = {
-            "model": st_model,
-            "sae": sae,
-            "mask": mask,
-            "batch_size": batch_size,
-            "use_reconstruction": use_reconstruction,
-        }
-    except Exception as e:
-        print(f"[ERROR] Failed to load model/SAE: {e}")
-        return
+    # 4. Process Datasets
+    # Handle both comma-separated and Python list format
+    data_dirs_str = args.data_dirs.strip()
+    if data_dirs_str.startswith("[") and data_dirs_str.endswith("]"):
+        # Python list format: ["dir1", "dir2"]
+        import ast
+        data_dirs = ast.literal_eval(data_dirs_str)
+    else:
+        # Comma-separated format
+        data_dirs = [d.strip() for d in data_dirs_str.split(",")]
 
-    # Extract checkpoint folder name from SAE path
-    # e.g., checkpoints/.../exp32_k1024_lr3e-04_aux1e+00_tgt2e-02/final_model.pt
-    # -> exp32_k1024_lr3e-04_aux1e+00_tgt2e-02
-    sae_path_obj = Path(sae_path)
-    checkpoint_folder_name = sae_path_obj.parent.name  # Get parent directory name
+    model_name = args.model
+    # Parse use_reconstruction (handle string from shell script)
+    use_reconstruction = args.use_reconstruction.lower() in ("true", "1", "yes")
 
-    # If it's just "final_model.pt" or similar, try to get a more descriptive name
-    if checkpoint_folder_name in ["", ".", "checkpoints"] or not checkpoint_folder_name:
-        # Fallback: use the full path but sanitized
-        checkpoint_folder_name = sae_path_obj.stem  # final_model or checkpoint_step_XXX
+    # Query/Passage Prefixes
+    q_prefix = get_e5_query_prefix(model_name)
+    p_prefix = get_e5_passage_prefix(model_name)
 
     for data_dir in data_dirs:
-        dataset_name = os.path.basename(data_dir.rstrip("/"))
-        print(f"\nEvaluating on dataset: {dataset_name}")
+        data_path = Path(data_dir)
+        dataset_name = data_path.name
+        logger.info(f"Evaluating on {dataset_name}...")
 
-        model_safe_name = get_safe_model_name(model)
-        mode_name = "reconstructed" if use_reconstruction else "features"
+        # Load Data
+        queries = {}
+        with open(data_path / "queries.jsonl", "r", encoding="utf-8") as f:
+            for line in f:
+                item = json.loads(line)
+                if "_id" in item and "text" in item:
+                    queries[item["_id"]] = q_prefix + item["text"]
+                else:
+                    # Fallback for {qid: text} or similar
+                    for k, v in item.items():
+                        if isinstance(v, str):
+                            queries[k] = q_prefix + v
+                        elif isinstance(v, dict) and "text" in v:
+                            queries[k] = q_prefix + v["text"]
+
+        corpus = {}
+        with open(data_path / "corpus.jsonl", "r", encoding="utf-8") as f:
+            for line in f:
+                item = json.loads(line)
+                # Handle standard BEIR {_id: ..., text: ...}
+                if "_id" in item:
+                    text = item.get("text", "")
+                    title = item.get("title", "")
+                    full_text = f"{title} {text}".strip() if title else text.strip()
+                    corpus[item["_id"]] = p_prefix + full_text
+                else:
+                    # Handle {doc_id: {text: ...}} format
+                    for did, doc in item.items():
+                        if isinstance(doc, dict):
+                            text = doc.get("text", "")
+                            title = doc.get("title", "")
+                            full_text = (
+                                f"{title} {text}".strip() if title else text.strip()
+                            )
+                            corpus[did] = p_prefix + full_text
+
+        qrels = {}
+        with open(data_path / "qrels.jsonl", "r", encoding="utf-8") as f:
+            for line in f:
+                item = json.loads(line)
+                # Handle BEIR flat format: {query-id: ..., corpus-id: ..., score: ...}
+                if "query-id" in item and "corpus-id" in item:
+                    qid = item["query-id"]
+                    did = item["corpus-id"]
+                    score = item["score"]
+                    if qid not in qrels:
+                        qrels[qid] = {}
+                    qrels[qid][did] = int(score)
+                else:
+                    # Handle nested format: {qid: {did: score}}
+                    for qid, docs in item.items():
+                        if qid not in qrels:
+                            qrels[qid] = {}
+                        for did, score in docs.items():
+                            qrels[qid][did] = int(score)
+
+        # Sort IDs to ensure alignment
+        q_ids = sorted(list(queries.keys()))
+        c_ids = sorted(list(corpus.keys()))
+
+        q_texts = [queries[qid] for qid in q_ids]
+        c_texts = [corpus[cid] for cid in c_ids]
+
+        # Encode (Base -> SAE -> Mask -> Recon)
+        logger.info("Encoding Queries...")
+        q_base = run_base_encoding(q_texts, model_name, max_seq_length=args.max_seq_length)
+        q_embs = process_embeddings(
+            runtime, q_base, mask, use_reconstruction, args.batch_size
+        )
+
+        logger.info("Encoding Corpus...")
+        c_base = run_base_encoding(c_texts, model_name, max_seq_length=args.max_seq_length)
+        c_embs = process_embeddings(
+            runtime, c_base, mask, use_reconstruction, args.batch_size
+        )
+
+        # Similarity Search
+        logger.info("Computing Similarity...")
+        # Normalize for Cosine Similarity
+        q_embs = F.normalize(q_embs, p=2, dim=1)
+        c_embs = F.normalize(c_embs, p=2, dim=1)
+
+        # Score Matrix: [Q, C]
+        scores = torch.mm(q_embs, c_embs.transpose(0, 1))
+
+        # Convert to Dictionary for BEIR
+        results_b = {}
+        # Optimization: Top-K only
+        top_k = 1000  # Evaluate up to @1000
+
+        logger.info("Formatting Results...")
+        for i, qid in enumerate(q_ids):
+            # Top K
+            row_scores = scores[i]
+            # sort descending
+            top_vals, top_inds = torch.topk(row_scores, k=min(top_k, len(c_ids)))
+
+            results_b[qid] = {}
+            for v, idx in zip(top_vals, top_inds):
+                doc_id = c_ids[int(idx)]
+                results_b[qid][doc_id] = float(v)
+
+        # Evaluate
+        logger.info("Calculating Metrics...")
+        ndcg, _map, recall, precision = compute_metrics(qrels, results_b)
+
+        # Print & Save
+        logger.info(f"[{dataset_name}] NDCG@20: {ndcg.get('NDCG@20', 0.0):.4f}")
+        logger.info(f"[{dataset_name}] Recall@20: {recall.get('Recall@20', 0.0):.4f}")
 
         # Build output directory name with checkpoint folder and mask threshold
-        if mask_threshold is not None:
-            # Format mask threshold: 0.95 -> "mask0_95", 0.995 -> "mask0_995"
-            mask_str = f"mask{str(mask_threshold).replace('.', '_')}"
-            output_dir = (
-                results_path / f"{model_safe_name}_{checkpoint_folder_name}_{mask_str}"
-            )
+        model_safe_name = args.model.replace("/", "_").replace(" ", "_")
+        if args.mask_threshold is not None:
+            mask_str = f"mask{str(args.mask_threshold).replace('.', '_')}"
+            output_subdir = out_dir / f"{model_safe_name}_{checkpoint_folder_name}_{mask_str}"
         else:
-            output_dir = results_path / f"{model_safe_name}_{checkpoint_folder_name}"
+            output_subdir = out_dir / f"{model_safe_name}_{checkpoint_folder_name}"
 
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output_file = output_dir / f"{dataset_name}_{mode_name}_results.json"
+        output_subdir.mkdir(parents=True, exist_ok=True)
+        out_file = output_subdir / f"{dataset_name}_results.json"
 
-        if output_file.exists():
-            print(f"[SKIP] Results already exist at: {output_file}")
-            try:
-                with output_file.open("r", encoding="utf-8") as f:
-                    existing_results = json.load(f)
-                    ndcg = existing_results.get("ndcg", {})
-                    recall = existing_results.get("recall", {})
-                    print(f"       NDCG@20: {ndcg.get('NDCG@20', 'N/A')}")
-                    print(f"       Recall@20: {recall.get('Recall@20', 'N/A')}")
-            except Exception as e:
-                print(f"       Warning: Error reading existing results: {e}")
-            continue
+        final_res = {
+            "model": model_name,
+            "sae": str(args.sae_path),
+            "mask": str(args.mask_path) if args.mask_path else None,
+            "mask_threshold": args.mask_threshold,
+            "checkpoint_folder": checkpoint_folder_name,
+            "dataset": dataset_name,
+            "use_reconstruction": use_reconstruction,
+            "ndcg": ndcg,
+            "recall": recall,
+            "map": _map,
+            "precision": precision,
+        }
+        with open(out_file, "w") as f:
+            json.dump(final_res, f, indent=2)
 
-        try:
-            queries = {}
-            corpus = {}
-            qrels = {}
+        logger.info(f"Results saved to: {out_file}")
 
-            with open(
-                os.path.join(data_dir, "queries.jsonl"), "r", encoding="utf-8"
-            ) as f:
-                for line in f:
-                    data = json.loads(line)
-                    if "_id" in data and "text" in data:
-                        queries[data["_id"]] = data["text"]
-                    else:
-                        queries.update(data)
-
-            with open(
-                os.path.join(data_dir, "corpus.jsonl"), "r", encoding="utf-8"
-            ) as f:
-                for line in f:
-                    data = json.loads(line)
-                    corpus.update(data)
-
-            with open(
-                os.path.join(data_dir, "qrels.jsonl"), "r", encoding="utf-8"
-            ) as f:
-                for line in f:
-                    data = json.loads(line)
-                    qrels.update(data)
-
-            queries = add_prefix_to_queries(queries, model)
-            corpus = add_prefix_to_corpus(corpus, model)
-
-            retriever = SAERetriever(**retriever_kwargs)
-            evaluator = EvaluateRetrieval(retriever=retriever)
-            results = evaluator.retrieve(corpus, queries)
-            ndcg, _map, recall, precision = evaluator.evaluate(
-                qrels, results, k_values=[1, 3, 5, 10, 20, 100, 1000]
-            )
-
-            results_dict = {
-                "model": model,
-                "sae": sae_path,
-                "mask": mask_path,
-                "mask_threshold": mask_threshold,
-                "checkpoint_folder": checkpoint_folder_name,
-                "dataset": dataset_name,
-                "ndcg": ndcg,
-                "map": _map,
-                "recall": recall,
-                "precision": precision,
-                "use_reconstruction": use_reconstruction,
-            }
-
-            with output_file.open("w", encoding="utf-8") as f:
-                json.dump(results_dict, f, indent=2, ensure_ascii=False)
-
-            print(f"Results saved to: {output_file}")
-            print(f"NDCG@20: {ndcg.get('NDCG@20', 'N/A')}")
-            print(f"Recall@20: {recall.get('Recall@20', 'N/A')}")
-        except FileNotFoundError as e:
-            print(f"[WARN] Missing file for dataset '{dataset_name}': {e}")
-        except Exception as e:
-            print(f"[ERROR] Evaluation failed for dataset '{dataset_name}': {e}")
+    logger.info("Done.")
 
 
 if __name__ == "__main__":
-    fire.Fire(run_sae_eval)
+    main()
