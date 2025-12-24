@@ -16,8 +16,19 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from .sae_runtime import SAERuntime
-from .utils import run_base_encoding, get_e5_query_prefix, get_e5_passage_prefix
+# Add evaluation directory to path for imports
+EVAL_DIR = Path(__file__).resolve().parent
+if str(EVAL_DIR) not in sys.path:
+    sys.path.insert(0, str(EVAL_DIR))
+
+# Import modules (works when run as script or module)
+import sae_runtime
+import utils
+
+SAERuntime = sae_runtime.SAERuntime
+run_base_encoding = utils.run_base_encoding
+get_e5_query_prefix = utils.get_e5_query_prefix
+get_e5_passage_prefix = utils.get_e5_passage_prefix
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
