@@ -118,6 +118,75 @@ After installation, you can also use:
 encodersae --model="roberta-base" --dataset="my-dataset" --epochs=15
 ```
 
+## Data Preparation
+
+### Downloading and Processing Multilingual Data
+
+The `download_data.py` script downloads and processes multilingual data from mMARCO and MIRACL datasets for training SAEs on 13 languages.
+
+**Supported Languages:**
+- Arabic (ar), Dutch (dt), English (en), Spanish (es), French (fr), Hindi (hi), Indonesian (id), Italian (it), Japanese (ja), Portuguese (pt), Russian (ru), Vietnamese (vi), Chinese (zh)
+
+**Usage:**
+
+```bash
+python data/download_data.py
+```
+
+**What it does:**
+
+1. **Downloads data** from:
+   - `unicamp-dl/mmarco` (all 13 languages)
+   - `miracl/miracl-corpus` (if available; handles missing languages gracefully)
+
+2. **Processes data** using `intfloat/multilingual-e5-large` tokenizer:
+   - **Smart chunking**: Documents >500 tokens are split into multiple chunks
+   - **Merging**: Documents <250 tokens are merged with other short documents
+   - **Token range**: All chunks are between 250-500 tokens
+   - **No overlaps**: Chunks don't overlap
+
+3. **Balances languages**: All languages are trimmed to the minimum count to ensure equal representation
+
+4. **Randomizes datasets**: Data from mMARCO and MIRACL are shuffled together to prevent training on one dataset completely before the other
+
+5. **Arranges in sets**: Data is arranged in sets of 13 (one item per language) to ensure each batch (multiple of 13) contains equal language representation
+
+6. **Splits train/val**: Creates 8:2 train/validation split with both splits being multiples of 13
+
+**Output:**
+
+The script generates two JSONL files in the `data/` directory:
+- `train.jsonl`: Training data
+- `val.jsonl`: Validation data
+
+Each line contains:
+```json
+{"text": "document text", "language": "en", "source": "mmarco"}
+```
+
+**Configuration:**
+
+You can modify the script to adjust:
+- `TARGET_MIN_LEN`: Minimum token length (default: 250)
+- `TARGET_MAX_LEN`: Maximum token length (default: 500)
+- `CACHE_DIR`: Cache directory for downloaded datasets
+- `NUM_PROC`: Number of processes for parallel processing
+
+**Example: Using the prepared data**
+
+```bash
+# After running download_data.py, train on the prepared data
+uv run -m EncoderSAE.main \
+    --dataset="./data/train.jsonl" \
+    --val_dataset="./data/val.jsonl" \
+    --model="intfloat/multilingual-e5-large" \
+    --batch_size=39 \  # Multiple of 13 for balanced batches
+    --expansion_factor=64 \
+    --sparsity=128
+```
+
+**Note:** The script ensures that batch sizes that are multiples of 13 will contain equal representation of all languages, which is important for balanced multilingual training.
+
 ## Architecture
 
 EncoderSAE uses a simple but effective architecture:
@@ -582,67 +651,83 @@ Metrics are computed at k = [1, 3, 5, 10, 20, 100, 1000].
 
 Evaluate language-agnostic embeddings created using SAE and language masks. This script measures how well SAE-enhanced embeddings perform on cross-lingual retrieval tasks.
 
+**Important:** This script uses **vLLM** (or HuggingFace transformers fallback) to extract embeddings, matching the same extraction method used during SAE training. This ensures embeddings are in the same distribution as the training data.
+
 ```bash
 # Evaluate SAE embeddings using sparse features (default)
-python evaluation/sae_eval.py \
-    --model="Alibaba-NLP/gte-multilingual-base" \
-    --sae_path="./checkpoints/.../final_model.pt" \
-    --mask_path="./analysis/.../language_features_combined_mask.pt" \
-    --data_dirs='["/path/to/dataset"]' \
-    --results_root="./results_sae_eval" \
-    --batch_size=128
-
-# Evaluate using reconstructed embeddings (back to base embedding space)
-python evaluation/sae_eval.py \
-    --model="Alibaba-NLP/gte-multilingual-base" \
-    --sae_path="./checkpoints/.../final_model.pt" \
-    --mask_path="./analysis/.../language_features_combined_mask.pt" \
-    --data_dirs='["/path/to/dataset"]' \
-    --use_reconstruction=True \
-    --batch_size=128
-
-# Evaluate on multiple custom datasets
 python evaluation/sae_eval.py \
     --model="intfloat/multilingual-e5-large" \
     --sae_path="./checkpoints/.../final_model.pt" \
     --mask_path="./analysis/.../language_features_combined_mask.pt" \
-    --data_dirs='["/path/to/dataset1", "/path/to/dataset2"]' \
+    --data_dirs='["/path/to/dataset"]' \
+    --results_root="./results_sae_eval" \
+    --batch_size=4096 \
     --use_reconstruction=False
+
+# Evaluate using reconstructed embeddings (back to base embedding space)
+python evaluation/sae_eval.py \
+    --model="intfloat/multilingual-e5-large" \
+    --sae_path="./checkpoints/.../final_model.pt" \
+    --mask_path="./analysis/.../language_features_combined_mask.pt" \
+    --data_dirs='["/path/to/dataset"]' \
+    --results_root="./results_sae_eval" \
+    --batch_size=4096 \
+    --use_reconstruction=True
+
+# Evaluate on multiple datasets (comma-separated format)
+python evaluation/sae_eval.py \
+    --model="intfloat/multilingual-e5-large" \
+    --sae_path="./checkpoints/.../final_model.pt" \
+    --mask_path="./analysis/.../language_features_combined_mask.pt" \
+    --data_dirs="/path/to/dataset1,/path/to/dataset2" \
+    --results_root="./results_sae_eval" \
+    --batch_size=4096 \
+    --use_reconstruction=True \
+    --mask_threshold=0.95
 ```
 
 **Parameters:**
 - `model`: Base model name (must match the model used for SAE training) - **required**
-- `sae_path`: Path to trained SAE checkpoint (`.pt` file) - **required**
+- `sae_path`: Path to trained SAE checkpoint (`.pt` file or checkpoint directory) - **required**
+  - If pointing to a file (e.g., `final_model.pt`), the script automatically uses the parent directory
+  - If pointing to a directory, the script looks for `final_model.pt` or other `.pt` files
 - `mask_path`: Path to language mask file (`.pt` file) - **required**
   - Use `language_features_combined_mask.pt` for union mask (removes all language-specific features)
   - Use `language_features_per_language_masks.pt` with `languages_to_disable` for selective removal
 - `data_dirs`: List of dataset directory paths (**required**)
+  - Can be comma-separated: `"/path/to/dataset1,/path/to/dataset2"`
+  - Or Python list format: `'["/path/to/dataset1", "/path/to/dataset2"]'`
 - `results_root`: Root directory for storing evaluation results (default: `"./results_sae_eval"`)
-- `batch_size`: Batch size for encoding and SAE processing (default: `128`)
-- `use_reconstruction`: If `True`, reconstructs back to base embedding space instead of using sparse features (default: `False`)
-  - `False`: Uses sparse SAE feature activations directly (higher dimensional, more interpretable)
-  - `True`: Reconstructs to original embedding dimension (same as base model, but language-agnostic)
+- `batch_size`: Batch size for SAE processing (default: `4096`)
+- `max_seq_length`: Maximum sequence length (default: `512`)
+- `use_reconstruction`: If `"True"`, reconstructs back to base embedding space instead of using sparse features (default: `"True"`)
+  - `"False"`: Uses sparse SAE feature activations directly (higher dimensional, more interpretable)
+  - `"True"`: Reconstructs to original embedding dimension (same as base model, but language-agnostic)
+- `mask_threshold`: Mask threshold used (for output directory naming, optional)
 
 **How It Works:**
-1. Encodes queries and corpus texts using the base `SentenceTransformer` model
+1. Extracts base embeddings using **vLLM** (matching training extraction method) or HuggingFace transformers fallback
 2. Passes embeddings through the SAE to extract sparse features
 3. Applies the language mask to zero out language-specific features
 4. Optionally reconstructs back to base embedding space (if `use_reconstruction=True`)
-5. Computes cosine similarities and evaluates retrieval performance
+5. Normalizes embeddings and computes cosine similarities
+6. Evaluates retrieval performance using BEIR metrics
 
 **Output:**
-Results are saved as JSON files in `{results_root}/{model_safe_name}_{sae_safe_name}/{dataset_name}_{features|reconstructed}_results.json`:
+Results are saved as JSON files in `{results_root}/{model_safe_name}_{checkpoint_folder}_{mask_str}/{dataset_name}_results.json`:
 ```json
 {
-  "model": "Alibaba-NLP/gte-multilingual-base",
+  "model": "intfloat/multilingual-e5-large",
   "sae": "./checkpoints/.../final_model.pt",
   "mask": "./analysis/.../language_features_combined_mask.pt",
-  "dataset": "Belebele_test",
+  "mask_threshold": 0.95,
+  "checkpoint_folder": "exp32_k1024_lr3e-04_aux1e+00_tgt2e-02",
+  "dataset": "Belebele_test_en",
+  "use_reconstruction": true,
   "ndcg": {"NDCG@1": 0.48, "NDCG@20": 0.65, ...},
   "map": {"MAP@100": 0.62, ...},
   "recall": {"Recall@1": 0.35, "Recall@20": 0.78, ...},
-  "precision": {"P@1": 0.35, "P@20": 0.16, ...},
-  "use_reconstruction": false
+  "precision": {"P@1": 0.35, "P@20": 0.16, ...}
 }
 ```
 
@@ -659,36 +744,104 @@ Results are saved as JSON files in `{results_root}/{model_safe_name}_{sae_safe_n
   - Better for comparing with baseline models
   - Useful for downstream tasks expecting original embedding size
 
+### Convenience Scripts for Complete Workflow
+
+EncoderSAE provides two convenience scripts that automate the complete analysis and evaluation workflow:
+
+#### 1. Single Checkpoint Evaluation (`run_analysis_eval.sh`)
+
+This script runs both language feature analysis and evaluation for a single checkpoint:
+
+```bash
+# Set environment variables (or edit the script defaults)
+export SAE_PATH="checkpoints/.../exp32_k1024_lr3e-04_aux1e+00_tgt2e-02/final_model.pt"
+export MODEL_NAME="intfloat/multilingual-e5-large"
+export VALIDATION_DATA="data/4lang_validation.jsonl"
+export MASK_THRESHOLD=0.95
+export EVAL_DATA_DIRS="data/Belebele/Belebele_test_en,data/Belebele/Belebele_test_de"
+export USE_RECONSTRUCTION=True
+export NUM_GPUS=2
+
+# Run the script
+bash run_analysis_eval.sh
+```
+
+**What it does:**
+1. Runs language feature analysis to generate the mask
+2. Runs evaluation with the generated mask
+3. Saves results with proper directory naming including checkpoint folder and mask threshold
+
+**Configuration (can be set via environment variables):**
+- `SAE_PATH`: Path to SAE checkpoint file (default: see script)
+- `MODEL_NAME`: Base model name (default: `intfloat/multilingual-e5-large`)
+- `VALIDATION_DATA`: Path to validation JSONL file for analysis
+- `MASK_THRESHOLD`: Threshold for language-specific feature detection (default: `0.95`)
+- `EXCLUDE_OVERLAPPING_FEATURES`: Exclude features common to multiple languages (default: `True`)
+- `EVAL_DATA_DIRS`: Comma-separated list of evaluation dataset directories
+- `USE_RECONSTRUCTION`: Use reconstructed embeddings (default: `True`)
+- `NUM_GPUS`: Number of GPUs for vLLM (default: auto-detect)
+- `BATCH_SIZE`: Batch size for evaluation (default: `1024`)
+
+#### 2. Multi-Checkpoint Sweep (`run_analysis_eval_sweep.sh`)
+
+This script runs analysis and evaluation across multiple checkpoints and mask thresholds:
+
+```bash
+# Edit the script to configure checkpoints and thresholds
+# CHECKPOINT_PATHS=(
+#     "checkpoints/.../exp32_k1024_lr3e-04_aux1e+00_tgt2e-02/final_model.pt"
+#     "checkpoints/.../exp64_k1024_lr3e-04_aux1e+00_tgt2e-02/final_model.pt"
+# )
+# MASK_THRESHOLDS=(0.95 0.98 0.995)
+
+# Or pass checkpoints as arguments
+bash run_analysis_eval_sweep.sh \
+    checkpoints/.../exp32_k1024_lr3e-04_aux1e+00_tgt2e-02/final_model.pt \
+    checkpoints/.../exp64_k1024_lr3e-04_aux1e+00_tgt2e-02/final_model.pt
+
+# Set other options via environment variables
+export EVAL_DATA_DIRS="data/Belebele/Belebele_test_en,data/Belebele/Belebele_test_de"
+export USE_RECONSTRUCTION=True
+export NUM_GPUS=2
+
+bash run_analysis_eval_sweep.sh
+```
+
+**What it does:**
+1. Iterates over all specified checkpoints
+2. For each checkpoint, tests multiple mask thresholds
+3. Runs complete analysis + evaluation pipeline for each combination
+4. Tracks progress and reports completion status
+
+**Configuration:**
+- Edit `CHECKPOINT_PATHS` array in the script or pass as command-line arguments
+- Edit `MASK_THRESHOLDS` array in the script
+- Other options inherited from `run_analysis_eval.sh` environment variables
+
 ### Example: Complete Evaluation Workflow
 
 ```bash
 # Step 1: Evaluate baseline model
 python evaluation/base_eval.py run \
     --model="intfloat/multilingual-e5-large" \
+    --data_dirs='["data/Belebele/Belebele_test_en"]' \
     --results_root="./results_baseline"
 
 # Step 2: Train SAE (see Training section above)
+# ... training produces checkpoints/.../final_model.pt
 
-# Step 3: Analyze language features (see Language Feature Analysis section above)
+# Step 3: Run analysis and evaluation for single checkpoint
+export SAE_PATH="checkpoints/.../exp32_k1024_lr3e-04_aux1e+00_tgt2e-02/final_model.pt"
+export MASK_THRESHOLD=0.95
+export EVAL_DATA_DIRS="data/Belebele/Belebele_test_en,data/Belebele/Belebele_test_de"
+bash run_analysis_eval.sh
 
-# Step 4: Evaluate SAE with sparse features
-python evaluation/sae_eval.py run_sae_eval \
-    --model="intfloat/multilingual-e5-large" \
-    --sae_path="./checkpoints/.../final_model.pt" \
-    --mask_path="./analysis/.../language_features_combined_mask.pt" \
-    --use_reconstruction=False \
-    --results_root="./results_sae_features"
+# Step 4: Or run sweep across multiple checkpoints and thresholds
+bash run_analysis_eval_sweep.sh
 
-# Step 5: Evaluate SAE with reconstructed embeddings
-python evaluation/sae_eval.py run_sae_eval \
-    --model="intfloat/multilingual-e5-large" \
-    --sae_path="./checkpoints/.../final_model.pt" \
-    --mask_path="./analysis/.../language_features_combined_mask.pt" \
-    --use_reconstruction=True \
-    --results_root="./results_sae_reconstructed"
-
-# Step 6: Compare results
+# Step 5: Compare results
 # Check NDCG@20, Recall@20, etc. across different configurations
+# Results are saved in results_sae_eval/ with organized directory structure
 ```
 
 ### Supported Models
