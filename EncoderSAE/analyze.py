@@ -303,18 +303,23 @@ def analyze_language_features(
                     batch_activations = all_activations[sae_start_idx:sae_end_idx]
                     batch_languages_chunk = text_to_language[sae_start_idx:sae_end_idx]
 
-                    # Pass through SAE to get features
+                    # Pass through SAE to get raw features (before top-k sparsity)
+                    # Use raw_features to match the working mask_builder.py approach
                     with torch.no_grad():
-                        _, features, _, _, _ = sae(batch_activations)
+                        _, _, _, _, raw_features = sae(batch_activations)
+                        # raw_features: [batch_size, dict_size] - features before top-k sparsity
 
-                        # Count which features fired for each language in this batch
-                        for i, sample_features in enumerate(features):
-                            language = batch_languages_chunk[i]
-                            # Get top-k active features
-                            active_features = (sample_features > 0).nonzero(as_tuple=True)[
-                                0
-                            ]
-                            for feat_idx in active_features:
+                        # Calculate activation rate per feature for this batch
+                        # Similar to mask_builder.py: (z.abs() > eps).float().mean(dim=0)
+                        eps = 1e-6  # Activation threshold
+                        batch_activation_rates = (raw_features.abs() > eps).float()  # [batch_size, dict_size]
+
+                        # Aggregate per language
+                        for i, language in enumerate(batch_languages_chunk):
+                            # For each feature, count if it's active in this sample
+                            active_features = batch_activation_rates[i] > 0
+                            active_indices = active_features.nonzero(as_tuple=True)[0]
+                            for feat_idx in active_indices:
                                 language_features[language][feat_idx.item()] += 1
         except ImportError:
             print("vLLM not available, falling back to HuggingFace")
@@ -355,14 +360,21 @@ def analyze_language_features(
                 hidden_states = outputs.last_hidden_state
                 batch_activations = mean_pool(hidden_states, attention_mask)
 
-                # Pass through SAE
-                _, features, _, _, _ = sae(batch_activations)
+                # Pass through SAE to get raw features (before top-k sparsity)
+                # Use raw_features to match the working mask_builder.py approach
+                _, _, _, _, raw_features = sae(batch_activations)
+                # raw_features: [batch_size, dict_size] - features before top-k sparsity
 
-                # Count which features fired for each language in this batch
-                for i, sample_features in enumerate(features):
-                    language = batch_languages[i]
-                    active_features = (sample_features > 0).nonzero(as_tuple=True)[0]
-                    for feat_idx in active_features:
+                # Calculate activation rate per feature for this batch
+                eps = 1e-6  # Activation threshold
+                batch_activation_rates = (raw_features.abs() > eps).float()  # [batch_size, dict_size]
+
+                # Aggregate per language
+                for i, language in enumerate(batch_languages):
+                    # For each feature, count if it's active in this sample
+                    active_features = batch_activation_rates[i] > 0
+                    active_indices = active_features.nonzero(as_tuple=True)[0]
+                    for feat_idx in active_indices:
                         language_features[language][feat_idx.item()] += 1
 
     # Analyze and rank features per language
