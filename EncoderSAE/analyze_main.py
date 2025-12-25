@@ -1,5 +1,26 @@
 """CLI entry point for language feature analysis."""
 
+# CRITICAL: Set multiprocessing start method BEFORE importing torch/vLLM to avoid CUDA+fork issues.
+# This mirrors EncoderSAE/main.py, and makes vLLM embedding extraction stable.
+import os
+
+os.environ["PYTHON_MULTIPROCESSING_START_METHOD"] = "spawn"
+
+import multiprocessing
+
+try:
+    multiprocessing.set_start_method("spawn", force=True)
+except RuntimeError:
+    current_method = multiprocessing.get_start_method(allow_none=True)
+    if current_method != "spawn":
+        import sys
+
+        print(
+            f"WARNING: Multiprocessing start method is '{current_method}', not 'spawn'.\n"
+            "This may cause CUDA errors with vLLM. If you see issues, run this module in a fresh process.",
+            file=sys.stderr,
+        )
+
 from typing import Optional
 
 import fire

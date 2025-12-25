@@ -2,6 +2,7 @@
 
 import torch
 import json
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -17,6 +18,25 @@ from EncoderSAE.model import EncoderSAE
 
 class SAERuntime:
     """Runtime for loading and running SAE models."""
+
+    @staticmethod
+    def _parse_hparams_from_ckpt_name(name: str) -> dict:
+        """
+        Best-effort parse of SAE hyperparams from checkpoint folder naming convention.
+
+        Expected pattern used by this repo's sweeps:
+          exp{EXPANSION}_k{SPARSITY}_lr...
+        Example:
+          exp32_k1024_lr3e-04_aux1e+00_tgt2e-02
+        """
+        out: dict = {}
+        m_exp = re.search(r"(?:^|_)exp(?P<exp>\d+)(?:_|$)", name)
+        m_k = re.search(r"(?:^|_)k(?P<k>\d+)(?:_|$)", name)
+        if m_exp:
+            out["expansion_factor_from_name"] = int(m_exp.group("exp"))
+        if m_k:
+            out["sparsity_from_name"] = int(m_k.group("k"))
+        return out
 
     def __init__(self, ckpt_dir: str):
         """
@@ -66,10 +86,56 @@ class SAERuntime:
         dict_size = encoder_weight.shape[0]
         expansion_factor = dict_size // input_dim
 
-        # Get sparsity from checkpoint or use default
-        sparsity = (
-            checkpoint.get("sparsity", 64) if isinstance(checkpoint, dict) else 64
-        )
+        # -----------------------------
+        # Infer sparsity (top-k) correctly
+        # -----------------------------
+        # CRITICAL: In this repo, `final_model.pt` is saved as a *plain state_dict*
+        # (see EncoderSAE/main.py). That means it does NOT contain a "sparsity" key,
+        # so defaulting to 64 here silently constructs the wrong SAE at eval time.
+        sparsity = None
+        if isinstance(checkpoint, dict):
+            # Support both "full checkpoint" and "state_dict-only" formats.
+            for key in ("sparsity", "k", "top_k", "topk"):
+                if key in checkpoint:
+                    try:
+                        sparsity = int(checkpoint[key])
+                        break
+                    except Exception:
+                        pass
+
+        # Fallback: parse from checkpoint folder name (exp{E}_k{K}_...)
+        if sparsity is None:
+            parsed = self._parse_hparams_from_ckpt_name(self.ckpt_dir.name)
+            sparsity = parsed.get("sparsity_from_name")
+            # Cross-check expansion factor if present in name (for sanity only)
+            exp_from_name = parsed.get("expansion_factor_from_name")
+            if exp_from_name is not None and exp_from_name != expansion_factor:
+                print(
+                    f"Warning: expansion_factor inferred from weights ({expansion_factor}) "
+                    f"differs from folder name ({exp_from_name}) for {self.ckpt_dir.name}"
+                )
+
+        if sparsity is None:
+            # Last resort
+            sparsity = 64
+            print(
+                f"WARNING: Could not infer SAE sparsity (top-k) from checkpoint. "
+                f"Defaulting to {sparsity}. This can severely degrade eval results. "
+                f"Checkpoint dir: {self.ckpt_dir}"
+            )
+
+        # Clamp to valid range (avoid accidental 'no-topk' mode when k >= dict_size)
+        if sparsity <= 0:
+            print(
+                f"WARNING: Parsed sparsity={sparsity} is not positive; defaulting to 64."
+            )
+            sparsity = 64
+        if sparsity >= dict_size:
+            print(
+                f"WARNING: Parsed sparsity={sparsity} >= dict_size={dict_size}. "
+                f"Clamping to dict_size-1 to preserve top-k behavior."
+            )
+            sparsity = dict_size - 1
 
         # Create and load model
         self.model = EncoderSAE(

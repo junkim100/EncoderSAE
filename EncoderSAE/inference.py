@@ -2,6 +2,7 @@
 
 import os
 import sys
+import re
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Union
@@ -90,9 +91,35 @@ def infer_language_agnostic(
         input_dim = encoder_weight.shape[1]
         dict_size = encoder_weight.shape[0]
         expansion_factor = dict_size // input_dim
-        sparsity = (
-            checkpoint.get("sparsity", 64) if isinstance(checkpoint, dict) else 64
-        )
+
+        # CRITICAL: `final_model.pt` is often saved as a plain state_dict (no "sparsity" key).
+        # Infer top-k from checkpoint metadata if present, otherwise from folder naming exp*_k*.
+        sparsity = None
+        if isinstance(checkpoint, dict):
+            for key in ("sparsity", "k", "top_k", "topk"):
+                if key in checkpoint:
+                    try:
+                        sparsity = int(checkpoint[key])
+                        break
+                    except Exception:
+                        pass
+
+        if sparsity is None:
+            m = re.search(r"(?:^|_)k(\d+)(?:_|$)", sae_path.parent.name)
+            if m:
+                sparsity = int(m.group(1))
+
+        if sparsity is None:
+            sparsity = 64
+            print(
+                f"WARNING: Could not infer SAE sparsity (top-k) from checkpoint; defaulting to {sparsity}. "
+                f"This may degrade inference quality. Checkpoint: {sae_path}"
+            )
+
+        if sparsity <= 0:
+            sparsity = 64
+        if sparsity >= dict_size:
+            sparsity = dict_size - 1
 
         sae = EncoderSAE(
             input_dim=input_dim,

@@ -36,13 +36,88 @@ def run_base_encoding(
         vllm_logger = logging.getLogger("vllm")
         vllm_logger.setLevel(logging.WARNING)
 
+        def _extract_embedding_tensor(output) -> torch.Tensor:
+            """
+            Extract a single embedding vector from a vLLM encode() output.
+            Mirrors the robust fallback logic used in EncoderSAE/data.py.
+            """
+            embedding_tensor = None
+
+            if hasattr(output, "outputs"):
+                # output.outputs may be:
+                # - an object with .embedding / .data
+                # - a list of objects with .embedding / .data
+                if hasattr(output.outputs, "embedding"):
+                    embedding_data = output.outputs.embedding
+                    embedding_tensor = (
+                        embedding_data.to(dtype=torch.float32)
+                        if isinstance(embedding_data, torch.Tensor)
+                        else torch.tensor(embedding_data, dtype=torch.float32)
+                    )
+                elif hasattr(output.outputs, "data"):
+                    embedding_data = output.outputs.data
+                    embedding_tensor = (
+                        embedding_data.to(dtype=torch.float32)
+                        if isinstance(embedding_data, torch.Tensor)
+                        else torch.tensor(embedding_data, dtype=torch.float32)
+                    )
+                elif hasattr(output.outputs, "__len__") and not isinstance(
+                    output.outputs, str
+                ):
+                    if len(output.outputs) > 0:
+                        first = output.outputs[0]
+                        if hasattr(first, "embedding"):
+                            embedding_data = first.embedding
+                        elif hasattr(first, "data"):
+                            embedding_data = first.data
+                        else:
+                            embedding_data = first
+                        embedding_tensor = (
+                            embedding_data.to(dtype=torch.float32)
+                            if isinstance(embedding_data, torch.Tensor)
+                            else torch.tensor(embedding_data, dtype=torch.float32)
+                        )
+                    else:
+                        raise ValueError("EmbeddingRequestOutput.outputs is empty")
+            elif hasattr(output, "embedding"):
+                embedding_data = output.embedding
+                embedding_tensor = (
+                    embedding_data.to(dtype=torch.float32)
+                    if isinstance(embedding_data, torch.Tensor)
+                    else torch.tensor(embedding_data, dtype=torch.float32)
+                )
+            elif isinstance(output, torch.Tensor):
+                embedding_tensor = output.to(dtype=torch.float32)
+            elif hasattr(output, "__array__"):
+                import numpy as np
+
+                embedding_tensor = torch.from_numpy(np.array(output)).to(
+                    dtype=torch.float32
+                )
+            else:
+                try:
+                    embedding_tensor = torch.tensor(output, dtype=torch.float32)
+                except Exception as e:
+                    raise ValueError(
+                        f"Cannot extract embedding from {type(output)}. "
+                        f"Available attributes: {[attr for attr in dir(output) if not attr.startswith('_')]}"
+                    ) from e
+
+            if embedding_tensor is None:
+                raise ValueError(f"Failed to extract embedding from {type(output)}")
+            if embedding_tensor.dtype != torch.float32:
+                embedding_tensor = embedding_tensor.to(dtype=torch.float32)
+            return embedding_tensor
+
         print(f"Encoding {len(texts)} texts with vLLM ({model_name})")
         llm = LLM(
             model=model_name,
             task="embed",
+            trust_remote_code=True,
             enforce_eager=True,
             gpu_memory_utilization=0.85,
             max_model_len=max_seq_length,
+            disable_log_stats=True,
         )
 
         all_embs = []
@@ -53,30 +128,7 @@ def run_base_encoding(
             outputs = llm.encode(batch_texts, pooling_task="embed", use_tqdm=False)
 
             for output in outputs:
-                embedding_tensor = None
-                # Extract embedding using same logic as data.py
-                if hasattr(output, "outputs"):
-                    if hasattr(output.outputs, "embedding"):
-                        embedding_data = output.outputs.embedding
-                    elif hasattr(output.outputs, "data"):
-                        embedding_data = output.outputs.data
-                    elif hasattr(output.outputs, "__len__") and len(output.outputs) > 0:
-                        embedding_data = output.outputs[0]
-                    else:
-                        raise ValueError("Could not extract embedding from vLLM output")
-                elif hasattr(output, "embedding"):
-                    embedding_data = output.embedding
-                elif isinstance(output, torch.Tensor):
-                    embedding_data = output
-                else:
-                    embedding_data = output
-
-                if isinstance(embedding_data, torch.Tensor):
-                    embedding_tensor = embedding_data.to(dtype=torch.float32)
-                else:
-                    embedding_tensor = torch.tensor(embedding_data, dtype=torch.float32)
-
-                all_embs.append(embedding_tensor)
+                all_embs.append(_extract_embedding_tensor(output))
 
         # Clean up vLLM
         import gc

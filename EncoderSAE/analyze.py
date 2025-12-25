@@ -20,24 +20,21 @@ from .utils import get_device
 
 @contextmanager
 def suppress_output():
-    """Temporarily suppress stdout/stderr to hide vLLM progress bars."""
+    """Temporarily suppress stdout to hide vLLM logs, but allow stderr for progress bars."""
     import os
     import sys
 
-    # Save original file descriptors
+    # Save original stdout
     original_stdout = sys.stdout
-    original_stderr = sys.stderr
 
-    # Redirect to devnull
+    # Redirect only stdout to devnull (keep stderr for tqdm progress bars)
     with open(os.devnull, "w") as devnull:
         sys.stdout = devnull
-        sys.stderr = devnull
         try:
             yield
         finally:
-            # Restore original stdout/stderr
+            # Restore original stdout
             sys.stdout = original_stdout
-            sys.stderr = original_stderr
 
 
 def analyze_language_features(
@@ -173,154 +170,145 @@ def analyze_language_features(
                 disable_log_stats=True,  # Disable vLLM's internal progress stats
             )
 
-            # Process all texts together - vLLM handles batching internally efficiently
-            # Note: batch_size parameter doesn't significantly affect vLLM's internal processing
-            # vLLM's encode() method processes requests efficiently regardless of input batch size
-            print(f"Processing {total_samples} samples with vLLM (internal batching)...")
+            # Process in batches to show progress and avoid OOM
+            # vLLM's encode() is efficient even with smaller batches
+            num_batches = (total_samples + batch_size - 1) // batch_size
+            print(
+                f"Processing {total_samples} samples with vLLM in {num_batches} batches..."
+            )
 
-            # Pass all texts at once - vLLM will handle batching internally for optimal GPU utilization
-            # This is more efficient than manual batching since vLLM can optimize its internal scheduling
+            all_outputs = []
             try:
-                with suppress_output():
-                    outputs = llm.encode(
-                        all_texts, pooling_task="embed", use_tqdm=False
-                    )
+                for batch_idx in tqdm(
+                    range(num_batches), desc="Encoding with vLLM", leave=True
+                ):
+                    start_idx = batch_idx * batch_size
+                    end_idx = min(start_idx + batch_size, total_samples)
+                    batch_texts = all_texts[start_idx:end_idx]
+                    with suppress_output():
+                        batch_outputs = llm.encode(
+                            batch_texts, pooling_task="embed", use_tqdm=False
+                        )
+                    all_outputs.extend(batch_outputs)
+                outputs = all_outputs
             except Exception as e:
-                # If memory error, fall back to batched processing
-                if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
-                    print(f"Memory error with full batch, falling back to batched processing (batch_size={batch_size})...")
-                    num_batches = (total_samples + batch_size - 1) // batch_size
-                    all_outputs = []
-                    for batch_idx in tqdm(
-                        range(num_batches), desc="Extracting features", leave=True
-                    ):
-                        start_idx = batch_idx * batch_size
-                        end_idx = min(start_idx + batch_size, total_samples)
-                        batch_texts = all_texts[start_idx:end_idx]
-                        with suppress_output():
-                            batch_outputs = llm.encode(
-                                batch_texts, pooling_task="embed", use_tqdm=False
-                            )
-                        all_outputs.extend(batch_outputs)
-                    outputs = all_outputs
-                else:
-                    # Re-raise with original stdout/stderr restored so error is visible
-                    print(f"Error during vLLM encode: {e}", file=sys.stderr)
-                    raise
+                # Re-raise with original stdout/stderr restored so error is visible
+                print(f"Error during vLLM encode: {e}", file=sys.stderr)
+                raise
 
-                # Extract embedding tensors with fallback logic (same as data.py)
-                embedding_tensors = []
-                for output in outputs:
-                    embedding_tensor = None
+            # Extract embedding tensors with fallback logic (same as data.py)
+            print("Extracting embeddings from vLLM outputs...")
+            embedding_tensors = []
+            for output in tqdm(outputs, desc="Extracting embeddings", leave=True):
+                embedding_tensor = None
 
-                    # Try multiple extraction paths (fallback logic)
-                    if hasattr(output, "outputs"):
-                        if hasattr(output.outputs, "embedding"):
-                            embedding_data = output.outputs.embedding
-                            embedding_tensor = (
-                                torch.tensor(embedding_data, dtype=torch.float32)
-                                if not isinstance(embedding_data, torch.Tensor)
-                                else embedding_data.to(dtype=torch.float32)
-                            )
-                        elif hasattr(output.outputs, "data"):
-                            embedding_data = output.outputs.data
-                            embedding_tensor = (
-                                torch.tensor(embedding_data, dtype=torch.float32)
-                                if not isinstance(embedding_data, torch.Tensor)
-                                else embedding_data.to(dtype=torch.float32)
-                            )
-                        elif hasattr(output.outputs, "__len__") and not isinstance(
-                            output.outputs, str
-                        ):
-                            if len(output.outputs) > 0:
-                                if hasattr(output.outputs[0], "embedding"):
-                                    embedding_data = output.outputs[0].embedding
-                                elif hasattr(output.outputs[0], "data"):
-                                    embedding_data = output.outputs[0].data
-                                else:
-                                    embedding_data = output.outputs[0]
-                                embedding_tensor = (
-                                    torch.tensor(embedding_data, dtype=torch.float32)
-                                    if not isinstance(embedding_data, torch.Tensor)
-                                    else embedding_data.to(dtype=torch.float32)
-                                )
-                            else:
-                                raise ValueError(
-                                    "EmbeddingRequestOutput.outputs is empty"
-                                )
-                    elif hasattr(output, "embedding"):
-                        embedding_data = output.embedding
+                # Try multiple extraction paths (fallback logic)
+                if hasattr(output, "outputs"):
+                    if hasattr(output.outputs, "embedding"):
+                        embedding_data = output.outputs.embedding
                         embedding_tensor = (
                             torch.tensor(embedding_data, dtype=torch.float32)
                             if not isinstance(embedding_data, torch.Tensor)
                             else embedding_data.to(dtype=torch.float32)
                         )
-                    elif isinstance(output, torch.Tensor):
-                        embedding_tensor = output.to(dtype=torch.float32)
-                    elif hasattr(output, "__array__"):
-                        import numpy as np
-
-                        embedding_tensor = torch.from_numpy(np.array(output)).to(
-                            dtype=torch.float32
+                    elif hasattr(output.outputs, "data"):
+                        embedding_data = output.outputs.data
+                        embedding_tensor = (
+                            torch.tensor(embedding_data, dtype=torch.float32)
+                            if not isinstance(embedding_data, torch.Tensor)
+                            else embedding_data.to(dtype=torch.float32)
                         )
-                    else:
-                        try:
-                            embedding_tensor = torch.tensor(output, dtype=torch.float32)
-                        except:
-                            raise ValueError(
-                                f"Cannot extract embedding from {type(output)}. "
-                                f"Available attributes: {[attr for attr in dir(output) if not attr.startswith('_')]}"
+                    elif hasattr(output.outputs, "__len__") and not isinstance(
+                        output.outputs, str
+                    ):
+                        if len(output.outputs) > 0:
+                            if hasattr(output.outputs[0], "embedding"):
+                                embedding_data = output.outputs[0].embedding
+                            elif hasattr(output.outputs[0], "data"):
+                                embedding_data = output.outputs[0].data
+                            else:
+                                embedding_data = output.outputs[0]
+                            embedding_tensor = (
+                                torch.tensor(embedding_data, dtype=torch.float32)
+                                if not isinstance(embedding_data, torch.Tensor)
+                                else embedding_data.to(dtype=torch.float32)
                             )
+                        else:
+                            raise ValueError("EmbeddingRequestOutput.outputs is empty")
+                elif hasattr(output, "embedding"):
+                    embedding_data = output.embedding
+                    embedding_tensor = (
+                        torch.tensor(embedding_data, dtype=torch.float32)
+                        if not isinstance(embedding_data, torch.Tensor)
+                        else embedding_data.to(dtype=torch.float32)
+                    )
+                elif isinstance(output, torch.Tensor):
+                    embedding_tensor = output.to(dtype=torch.float32)
+                elif hasattr(output, "__array__"):
+                    import numpy as np
 
-                    if embedding_tensor is None:
+                    embedding_tensor = torch.from_numpy(np.array(output)).to(
+                        dtype=torch.float32
+                    )
+                else:
+                    try:
+                        embedding_tensor = torch.tensor(output, dtype=torch.float32)
+                    except:
                         raise ValueError(
-                            f"Failed to extract embedding from {type(output)}"
+                            f"Cannot extract embedding from {type(output)}. "
+                            f"Available attributes: {[attr for attr in dir(output) if not attr.startswith('_')]}"
                         )
 
-                    # Ensure it's float32
-                    if not isinstance(embedding_tensor, torch.Tensor):
-                        embedding_tensor = torch.tensor(
-                            embedding_tensor, dtype=torch.float32
-                        )
+                if embedding_tensor is None:
+                    raise ValueError(f"Failed to extract embedding from {type(output)}")
 
-                    if embedding_tensor.dtype != torch.float32:
-                        embedding_tensor = embedding_tensor.to(dtype=torch.float32)
+                # Ensure it's float32
+                if not isinstance(embedding_tensor, torch.Tensor):
+                    embedding_tensor = torch.tensor(
+                        embedding_tensor, dtype=torch.float32
+                    )
+                if embedding_tensor.dtype != torch.float32:
+                    embedding_tensor = embedding_tensor.to(dtype=torch.float32)
 
-                    embedding_tensors.append(embedding_tensor)
+                embedding_tensors.append(embedding_tensor)
 
-                # Stack into batch tensor
-                all_activations = torch.stack(embedding_tensors)
-                all_activations = all_activations.to(device)
+            # Stack into batch tensor
+            all_activations = torch.stack(embedding_tensors).to(device)
 
-                # Process through SAE in batches to avoid memory issues
-                # Use batch_size for SAE processing (this actually matters for GPU memory)
-                sae_batch_size = batch_size if batch_size > 0 else 1024
-                num_sae_batches = (len(all_activations) + sae_batch_size - 1) // sae_batch_size
+            # Process through SAE in batches to avoid memory issues
+            # Use batch_size for SAE processing (this actually matters for GPU memory)
+            sae_batch_size = batch_size if batch_size > 0 else 1024
+            num_sae_batches = (
+                len(all_activations) + sae_batch_size - 1
+            ) // sae_batch_size
+            print(
+                f"Processing {len(all_activations)} activations through SAE in {num_sae_batches} batches..."
+            )
 
-                for sae_batch_idx in range(num_sae_batches):
-                    sae_start_idx = sae_batch_idx * sae_batch_size
-                    sae_end_idx = min(sae_start_idx + sae_batch_size, len(all_activations))
-                    batch_activations = all_activations[sae_start_idx:sae_end_idx]
-                    batch_languages_chunk = text_to_language[sae_start_idx:sae_end_idx]
+            for sae_batch_idx in tqdm(
+                range(num_sae_batches), desc="Extracting SAE features", leave=True
+            ):
+                sae_start_idx = sae_batch_idx * sae_batch_size
+                sae_end_idx = min(sae_start_idx + sae_batch_size, len(all_activations))
+                batch_activations = all_activations[sae_start_idx:sae_end_idx]
+                batch_languages_chunk = text_to_language[sae_start_idx:sae_end_idx]
 
-                    # Pass through SAE to get raw features (before top-k sparsity)
-                    # Use raw_features to match the working mask_builder.py approach
-                    with torch.no_grad():
-                        _, _, _, _, raw_features = sae(batch_activations)
-                        # raw_features: [batch_size, dict_size] - features before top-k sparsity
+                # Pass through SAE to get raw features (before top-k sparsity)
+                # Use raw_features to match the working mask_builder.py approach
+                with torch.no_grad():
+                    _, _, _, _, raw_features = sae(batch_activations)
+                    # raw_features: [batch_size, dict_size] - features before top-k sparsity
 
-                        # Calculate activation rate per feature for this batch
-                        # Similar to mask_builder.py: (z.abs() > eps).float().mean(dim=0)
-                        eps = 1e-6  # Activation threshold
-                        batch_activation_rates = (raw_features.abs() > eps).float()  # [batch_size, dict_size]
+                    # Calculate activation rate per feature for this batch
+                    eps = 1e-6  # Activation threshold
+                    batch_activation_rates = (raw_features.abs() > eps).float()
 
-                        # Aggregate per language
-                        for i, language in enumerate(batch_languages_chunk):
-                            # For each feature, count if it's active in this sample
-                            active_features = batch_activation_rates[i] > 0
-                            active_indices = active_features.nonzero(as_tuple=True)[0]
-                            for feat_idx in active_indices:
-                                language_features[language][feat_idx.item()] += 1
+                    # Aggregate per language
+                    for i, language in enumerate(batch_languages_chunk):
+                        active_features = batch_activation_rates[i] > 0
+                        active_indices = active_features.nonzero(as_tuple=True)[0]
+                        for feat_idx in active_indices:
+                            language_features[language][feat_idx.item()] += 1
         except ImportError:
             print("vLLM not available, falling back to HuggingFace")
             use_vllm = False
@@ -367,7 +355,9 @@ def analyze_language_features(
 
                 # Calculate activation rate per feature for this batch
                 eps = 1e-6  # Activation threshold
-                batch_activation_rates = (raw_features.abs() > eps).float()  # [batch_size, dict_size]
+                batch_activation_rates = (
+                    raw_features.abs() > eps
+                ).float()  # [batch_size, dict_size]
 
                 # Aggregate per language
                 for i, language in enumerate(batch_languages):
