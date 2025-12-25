@@ -4,6 +4,7 @@ import math
 import json
 import tempfile
 import shutil
+import time
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from functools import partial
 from datasets import (
@@ -743,6 +744,39 @@ def save_jsonl(data, filepath):
     print(f"  -> Saved {len(data):,} items to {filepath}")
 
 
+def robust_rmtree(path, max_retries=3, delay=1.0):
+    """
+    Robustly remove a directory tree with retries and error handling.
+
+    Args:
+        path: Path to directory to remove
+        max_retries: Maximum number of retry attempts
+        delay: Delay between retries in seconds
+    """
+    if not os.path.exists(path):
+        return
+
+    for attempt in range(max_retries):
+        try:
+            # Use onerror handler to handle permission errors
+            def handle_remove_readonly(func, path, exc):
+                """Handle read-only files by making them writable."""
+                if os.path.exists(path):
+                    os.chmod(path, 0o777)
+                    func(path)
+
+            shutil.rmtree(path, onerror=handle_remove_readonly)
+            return  # Success
+        except (OSError, PermissionError) as e:
+            if attempt < max_retries - 1:
+                print(f"  Warning: Failed to remove {path} (attempt {attempt + 1}/{max_retries}): {e}")
+                print(f"  Retrying in {delay} seconds...")
+                time.sleep(delay)
+            else:
+                print(f"  Warning: Could not remove {path} after {max_retries} attempts: {e}")
+                print(f"  Directory preserved for manual cleanup")
+
+
 def count_sources_in_data(data):
     """
     Count how many items come from each source in the final dataset.
@@ -1185,8 +1219,11 @@ def main():
         print("=" * 80)
 
         if os.path.exists(TEMP_DIR):
-            shutil.rmtree(TEMP_DIR)
-            print(f"  -> Removed {TEMP_DIR}")
+            robust_rmtree(TEMP_DIR)
+            if not os.path.exists(TEMP_DIR):
+                print(f"  -> Removed {TEMP_DIR}")
+            else:
+                print(f"  -> Note: Some files in {TEMP_DIR} could not be removed (may need manual cleanup)")
 
         print("\n" + "=" * 80)
         print("Done! Output files:")
