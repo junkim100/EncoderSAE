@@ -272,17 +272,35 @@ def analyze_language_features(
 
                 embedding_tensors.append(embedding_tensor)
 
-            # Stack into batch tensor
+            # Stack into batch tensor (keep on GPU for efficiency)
             all_activations = torch.stack(embedding_tensors).to(device)
 
             # Process through SAE in batches to avoid memory issues
-            # Use batch_size for SAE processing (this actually matters for GPU memory)
-            sae_batch_size = batch_size if batch_size > 0 else 1024
+            # Use larger batch size for SAE (forward pass only, can be bigger than encoding batch)
+            # For large dict_size (e.g., 65536), use smaller batches to avoid OOM
+            dict_size = sae.dict_size
+            if dict_size > 50000:
+                # Large dict: use smaller batches to avoid OOM
+                sae_batch_size = min(batch_size * 2, 2048) if batch_size > 0 else 2048
+            else:
+                # Smaller dict: can use larger batches
+                sae_batch_size = min(batch_size * 4, 4096) if batch_size > 0 else 4096
+
             num_sae_batches = (
                 len(all_activations) + sae_batch_size - 1
             ) // sae_batch_size
             print(
-                f"Processing {len(all_activations)} activations through SAE in {num_sae_batches} batches..."
+                f"Processing {len(all_activations)} activations through SAE in {num_sae_batches} batches (batch_size={sae_batch_size})..."
+            )
+
+            # Pre-allocate language index mapping for vectorized operations
+            unique_languages = sorted(set(text_to_language))
+            lang_to_idx = {lang: idx for idx, lang in enumerate(unique_languages)}
+            # Convert language list to tensor indices for vectorized operations
+            language_indices = torch.tensor(
+                [lang_to_idx[lang] for lang in text_to_language],
+                device=device,
+                dtype=torch.long,
             )
 
             for sae_batch_idx in tqdm(
@@ -291,7 +309,7 @@ def analyze_language_features(
                 sae_start_idx = sae_batch_idx * sae_batch_size
                 sae_end_idx = min(sae_start_idx + sae_batch_size, len(all_activations))
                 batch_activations = all_activations[sae_start_idx:sae_end_idx]
-                batch_languages_chunk = text_to_language[sae_start_idx:sae_end_idx]
+                batch_language_indices = language_indices[sae_start_idx:sae_end_idx]
 
                 # Pass through SAE to get raw features (before top-k sparsity)
                 # Use raw_features to match the working mask_builder.py approach
@@ -299,16 +317,32 @@ def analyze_language_features(
                     _, _, _, _, raw_features = sae(batch_activations)
                     # raw_features: [batch_size, dict_size] - features before top-k sparsity
 
-                    # Calculate activation rate per feature for this batch
+                    # Calculate which features are active (vectorized)
                     eps = 1e-6  # Activation threshold
-                    batch_activation_rates = (raw_features.abs() > eps).float()
+                    active_mask = raw_features.abs() > eps  # [batch_size, dict_size]
 
-                    # Aggregate per language
-                    for i, language in enumerate(batch_languages_chunk):
-                        active_features = batch_activation_rates[i] > 0
-                        active_indices = active_features.nonzero(as_tuple=True)[0]
-                        for feat_idx in active_indices:
-                            language_features[language][feat_idx.item()] += 1
+                    # Vectorized aggregation per language
+                    # For each language, count how many samples have each feature active
+                    for lang_idx, language in enumerate(unique_languages):
+                        # Get samples for this language in this batch
+                        lang_mask = batch_language_indices == lang_idx  # [batch_size]
+                        if not lang_mask.any():
+                            continue
+
+                        # Count how many samples have each feature active (binary: feature fired or not)
+                        # active_mask[lang_mask] -> [num_samples_for_lang, dict_size]
+                        # Sum along batch dimension gives count of samples where feature fired
+                        lang_feature_counts = (
+                            active_mask[lang_mask].sum(dim=0).cpu()
+                        )  # [dict_size]
+
+                        # Update counts (only for features that fired at least once)
+                        active_feat_indices = lang_feature_counts.nonzero(
+                            as_tuple=True
+                        )[0]
+                        for feat_idx in active_feat_indices:
+                            count = lang_feature_counts[feat_idx].item()
+                            language_features[language][feat_idx.item()] += int(count)
         except ImportError:
             print("vLLM not available, falling back to HuggingFace")
             use_vllm = False
@@ -353,19 +387,37 @@ def analyze_language_features(
                 _, _, _, _, raw_features = sae(batch_activations)
                 # raw_features: [batch_size, dict_size] - features before top-k sparsity
 
-                # Calculate activation rate per feature for this batch
+                # Calculate which features are active (vectorized)
                 eps = 1e-6  # Activation threshold
-                batch_activation_rates = (
-                    raw_features.abs() > eps
-                ).float()  # [batch_size, dict_size]
+                active_mask = raw_features.abs() > eps  # [batch_size, dict_size]
 
-                # Aggregate per language
-                for i, language in enumerate(batch_languages):
-                    # For each feature, count if it's active in this sample
-                    active_features = batch_activation_rates[i] > 0
-                    active_indices = active_features.nonzero(as_tuple=True)[0]
-                    for feat_idx in active_indices:
-                        language_features[language][feat_idx.item()] += 1
+                # Vectorized aggregation per language
+                unique_languages_batch = sorted(set(batch_languages))
+                lang_to_idx = {
+                    lang: idx for idx, lang in enumerate(unique_languages_batch)
+                }
+                batch_lang_indices = torch.tensor(
+                    [lang_to_idx[lang] for lang in batch_languages],
+                    device=device,
+                    dtype=torch.long,
+                )
+
+                for lang_idx, language in enumerate(unique_languages_batch):
+                    # Get samples for this language in this batch
+                    lang_mask = batch_lang_indices == lang_idx  # [batch_size]
+                    if not lang_mask.any():
+                        continue
+
+                    # Count how many samples have each feature active
+                    lang_feature_counts = (
+                        active_mask[lang_mask].sum(dim=0).cpu()
+                    )  # [dict_size]
+
+                    # Update counts (only for features that fired at least once)
+                    active_feat_indices = lang_feature_counts.nonzero(as_tuple=True)[0]
+                    for feat_idx in active_feat_indices:
+                        count = lang_feature_counts[feat_idx].item()
+                        language_features[language][feat_idx.item()] += int(count)
 
     # Analyze and rank features per language
     print("\n" + "=" * 60)
