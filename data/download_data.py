@@ -990,7 +990,16 @@ def main():
                     if existing_count > min_count:
                         ds = load_from_disk(temp_path)
                         ds_trimmed = ds.select(range(min_count))
-                        ds_trimmed.save_to_disk(temp_path)
+                        # Save to temporary path first, then replace
+                        temp_trim_path = temp_path + "_trimming"
+                        if os.path.exists(temp_trim_path):
+                            shutil.rmtree(temp_trim_path)
+                        ds_trimmed.save_to_disk(temp_trim_path)
+                        # Delete old dataset and rename new one
+                        del ds, ds_trimmed
+                        gc.collect()
+                        shutil.rmtree(temp_path)
+                        os.rename(temp_trim_path, temp_path)
                         print(f"  [{lang_code}]: Trimmed to {min_count:,} items")
                         # Update existing_count to reflect trimmed size
                         existing_count = min_count
