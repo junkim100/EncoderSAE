@@ -4,6 +4,8 @@ import math
 import json
 import tempfile
 import shutil
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from functools import partial
 from datasets import (
     load_dataset,
     concatenate_datasets,
@@ -14,14 +16,19 @@ from datasets import (
 )
 from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer
+import torch
 
 # =========================================================
 # 1. Configuration
 # =========================================================
 CACHE_DIR = "/data_x/aa007878/encodersae/data/cache"
 TEMP_DIR = "/data_x/aa007878/encodersae/data/temp_processed"  # Temp directory for per-language files
-NUM_PROC = 60
+NUM_PROC = 60  # Number of processes for dataset.map operations (per language)
+USE_GPU = (
+    torch.cuda.is_available()
+)  # GPU detection (tokenizers are CPU-bound, not GPU-bound)
 TOKENIZER_NAME = "intfloat/multilingual-e5-large"
+TOKENIZATION_BATCH_SIZE = 2000  # Batch size for tokenization operations
 MODEL_MAX_LENGTH = 512  # Model's maximum sequence length
 TARGET_MIN_LEN = 250
 # Reserve space for special tokens (E5 typically adds 2 tokens: start + end)
@@ -47,6 +54,10 @@ LANG_CODES = [
     "vi",
     "zh",
 ]
+
+MAX_WORKERS = len(
+    LANG_CODES
+)  # Process all languages simultaneously (each uses separate temp files)
 
 # Mapping from language codes to mmarco full names
 MMARCO_LANG_MAP = {
@@ -392,7 +403,7 @@ def estimate_chunk_count(lang_code, sample_size=ESTIMATION_SAMPLE_SIZE):
         sample_chunked = sample.map(
             smart_chunking_v2,
             batched=True,
-            batch_size=2000,
+            batch_size=TOKENIZATION_BATCH_SIZE,
             num_proc=NUM_PROC,
             remove_columns=sample.column_names,
         )
@@ -407,7 +418,7 @@ def estimate_chunk_count(lang_code, sample_size=ESTIMATION_SAMPLE_SIZE):
         rechunked = combined.map(
             smart_chunking_v2,
             batched=True,
-            batch_size=2000,
+            batch_size=TOKENIZATION_BATCH_SIZE,
             num_proc=NUM_PROC,
             remove_columns=combined.column_names,
         )
@@ -486,7 +497,7 @@ def process_language(lang_code, max_items=None, save_path=None):
     mmarco_chunked = mmarco_std.map(
         smart_chunking_v2,
         batched=True,
-        batch_size=2000,
+        batch_size=TOKENIZATION_BATCH_SIZE,
         num_proc=NUM_PROC,
         remove_columns=mmarco_std.column_names,
     )
@@ -499,7 +510,7 @@ def process_language(lang_code, max_items=None, save_path=None):
         miracl_chunked = miracl_std.map(
             smart_chunking_v2,
             batched=True,
-            batch_size=2000,
+            batch_size=TOKENIZATION_BATCH_SIZE,
             num_proc=NUM_PROC,
             remove_columns=miracl_std.column_names,
         )
@@ -626,19 +637,69 @@ def arrange_in_sets(data_by_lang):
     for i in range(num_sets):
         # One item from each language (in fixed order)
         for lang_code in LANG_CODES:
-            item = balanced_data[lang_code][i]
-            # Handle both list and scalar values from dataset
-            text = item["text"] if isinstance(item["text"], str) else item["text"][0]
-            lang = (
-                item["language"]
-                if isinstance(item["language"], str)
-                else item["language"][0]
-            )
-            source = item.get("source", "unknown")
-            if isinstance(source, list):
-                source = source[0] if source else "unknown"
+            try:
+                ds = balanced_data[lang_code]
 
-            arranged_data.append({"text": text, "language": lang, "source": source})
+                # Verify we have a Dataset object
+                if not hasattr(ds, "__getitem__"):
+                    raise ValueError(
+                        f"Expected Dataset object for {lang_code}, got {type(ds)}"
+                    )
+
+                # Verify dataset has required columns
+                if hasattr(ds, "column_names"):
+                    required_cols = {"text", "language", "source"}
+                    missing = required_cols - set(ds.column_names)
+                    if missing:
+                        raise ValueError(
+                            f"Dataset for {lang_code} missing columns: {missing}. Available: {ds.column_names}"
+                        )
+
+                # Access item by integer index (not string/column name)
+                # Important: use integer index, not string key
+                item = ds[int(i)]  # Explicitly cast to int to avoid any confusion
+
+                # Extract fields safely
+                text = item.get("text", "")
+                if isinstance(text, list):
+                    text = text[0] if text else ""
+                if not isinstance(text, str):
+                    text = str(text)
+
+                lang = item.get("language", lang_code)
+                if isinstance(lang, list):
+                    lang = lang[0] if lang else lang_code
+                if not isinstance(lang, str):
+                    lang = str(lang)
+
+                source = item.get("source", "unknown")
+                if isinstance(source, list):
+                    source = source[0] if source else "unknown"
+                if not isinstance(source, str):
+                    source = str(source)
+
+                arranged_data.append({"text": text, "language": lang, "source": source})
+            except KeyError as e:
+                # This might be the "column 'it' wasn't found" error
+                print(f"\nKeyError accessing item {i} for language {lang_code}: {e}")
+                print(f"  This might indicate a column access issue")
+                print(f"  Dataset type: {type(ds)}")
+                print(
+                    f"  Dataset columns: {ds.column_names if hasattr(ds, 'column_names') else 'unknown'}"
+                )
+                print(f"  Dataset length: {len(ds)}")
+                print(f"  Accessing with integer index: {i} (type: {type(i)})")
+                raise
+            except Exception as e:
+                print(f"\nError accessing item {i} for language {lang_code}: {e}")
+                print(f"  Error type: {type(e).__name__}")
+                print(f"  Dataset type: {type(ds)}")
+                print(
+                    f"  Dataset columns: {ds.column_names if hasattr(ds, 'column_names') else 'unknown'}"
+                )
+                print(f"  Dataset length: {len(ds)}")
+                print(f"  Accessing with integer index: {i} (type: {type(i)})")
+                raise
 
     return arranged_data, num_sets
 
@@ -818,6 +879,25 @@ def save_statistics(stats_by_lang, train_data, val_data, output_dir):
     return statistics
 
 
+def _estimate_language_wrapper(lang_code):
+    """Wrapper for parallel estimation."""
+    try:
+        count = estimate_chunk_count(lang_code)
+        return lang_code, count, None
+    except Exception as e:
+        return lang_code, None, str(e)
+
+
+def _process_language_wrapper(args):
+    """Wrapper for parallel language processing."""
+    lang_code, min_count, temp_path = args
+    try:
+        _, stats = process_language(lang_code, max_items=min_count, save_path=temp_path)
+        return lang_code, stats, None
+    except Exception as e:
+        return lang_code, None, str(e)
+
+
 def main():
     """Main execution pipeline with optimizations."""
     print("=" * 80)
@@ -849,17 +929,32 @@ def main():
                     pass
 
         estimated_counts = {}
+        langs_to_estimate = [
+            lang_code for lang_code in LANG_CODES if lang_code not in existing_counts
+        ]
+
+        # Parallel estimation for languages that need it
+        if langs_to_estimate:
+            print(
+                f"  Estimating {len(langs_to_estimate)} languages in parallel (max_workers={MAX_WORKERS})..."
+            )
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                future_to_lang = {
+                    executor.submit(_estimate_language_wrapper, lang_code): lang_code
+                    for lang_code in langs_to_estimate
+                }
+                for future in as_completed(future_to_lang):
+                    lang_code, count, error = future.result()
+                    if error:
+                        print(f"Error estimating {lang_code}: {error}")
+                        raise RuntimeError(f"Failed to estimate {lang_code}: {error}")
+                    estimated_counts[lang_code] = count
+                    print(f"  ✓ [{lang_code}]: Estimated {count:,} chunks")
+
+        # Add existing counts
         for lang_code in LANG_CODES:
             if lang_code in existing_counts:
-                # Use existing count if temp file exists
                 estimated_counts[lang_code] = existing_counts[lang_code]
-            else:
-                try:
-                    count = estimate_chunk_count(lang_code)
-                    estimated_counts[lang_code] = count
-                except Exception as e:
-                    print(f"Error estimating {lang_code}: {e}")
-                    raise
 
         min_count = min(estimated_counts.values())
         print(f"\n>>> Minimum estimated count: {min_count:,}")
@@ -868,10 +963,17 @@ def main():
         # Phase 2: Process each language and save to temp files (with early stopping)
         print("\n" + "=" * 80)
         print("Phase 2: Processing languages and saving to temp files...")
+        print(f"  Using parallel processing with {MAX_WORKERS} workers")
+        if USE_GPU:
+            print(f"  GPU available: {torch.cuda.get_device_name(0)}")
         print("=" * 80)
 
         temp_paths = {}
         stats_by_lang = {}  # Collect statistics for each language
+
+        # Prepare languages that need processing
+        langs_to_process = []
+        langs_to_skip = []
 
         for lang_code in LANG_CODES:
             temp_path = os.path.join(TEMP_DIR, lang_code)
@@ -890,45 +992,83 @@ def main():
                         ds_trimmed = ds.select(range(min_count))
                         ds_trimmed.save_to_disk(temp_path)
                         print(f"  [{lang_code}]: Trimmed to {min_count:,} items")
+                        # Update existing_count to reflect trimmed size
+                        existing_count = min_count
 
                     # Load stats from existing file (count sources accurately)
+                    # Use the trimmed count, not the original count
                     ds = load_from_disk(temp_path)
+                    actual_count = len(ds)  # This should be min_count after trimming
                     source_counts = {}
-                    for i in range(len(ds)):
-                        item = ds[i]
-                        source = item.get("source", "unknown")
-                        # Handle comma-separated sources (merged fragments)
-                        sources = [s.strip() for s in source.split(",")]
-                        for s in sources:
-                            source_counts[s] = source_counts.get(s, 0) + 1
+                    try:
+                        for i in range(len(ds)):
+                            item = ds[i]  # Access by integer index
+                            source = item.get("source", "unknown")
+                            if isinstance(source, list):
+                                source = source[0] if source else "unknown"
+                            # Handle comma-separated sources (merged fragments)
+                            sources = [s.strip() for s in str(source).split(",")]
+                            for s in sources:
+                                source_counts[s] = source_counts.get(s, 0) + 1
+                    except Exception as e:
+                        print(f"Warning: Error counting sources for {lang_code}: {e}")
+                        print(
+                            f"  Dataset columns: {ds.column_names if hasattr(ds, 'column_names') else 'unknown'}"
+                        )
+                        # Use defaults
+                        source_counts = {"mmarco": len(ds), "miracl": 0}
 
-                    # Count sources in the existing file
-                    total = len(ds)
+                    # Count sources in the existing file (after trimming)
+                    # Note: For existing files, we don't know the original "available" counts
+                    # We'll approximate them, but the "used" counts will be updated later
+                    # from the final arranged data to ensure accuracy
                     used_miracl = source_counts.get("miracl", 0)
                     used_mmarco = source_counts.get("mmarco", 0)
-                    # Note: merged fragments may have both sources, count separately
-                    # For merged fragments, we count them as contributing to both
-                    # But for "used" counts, we'll use the actual counts
+                    total_used = actual_count  # This is the trimmed count
+
+                    # Estimate available counts (we don't have original data)
+                    # These will be approximate for existing files
+                    estimated_available_mmarco = (
+                        used_mmarco  # Assume all available was used
+                    )
+                    estimated_available_miracl = (
+                        used_miracl  # Assume all available was used
+                    )
 
                     stats_by_lang[lang_code] = {
-                        "available_mmarco": used_mmarco,  # From existing file, approximate
-                        "available_miracl": used_miracl,  # From existing file, approximate
+                        "available_mmarco": estimated_available_mmarco,  # Approximate for existing files
+                        "available_miracl": estimated_available_miracl,  # Approximate for existing files
                         "used_mmarco": used_mmarco,
                         "used_miracl": used_miracl,
-                        "total_used": total,
+                        "total_used": total_used,  # Will be updated from final data
                         "unused_mmarco": 0,  # Unknown for existing files
                         "unused_miracl": 0,  # Unknown for existing files
                     }
-                    continue
+                    langs_to_skip.append(lang_code)
+                else:
+                    # Needs processing (existing file has less than min_count)
+                    langs_to_process.append((lang_code, min_count, temp_path))
+            else:
+                # New language, needs processing
+                langs_to_process.append((lang_code, min_count, temp_path))
 
-            try:
-                _, stats = process_language(
-                    lang_code, max_items=min_count, save_path=temp_path
-                )
-                stats_by_lang[lang_code] = stats
-            except Exception as e:
-                print(f"Error processing {lang_code}: {e}")
-                raise
+        # Process languages in parallel
+        if langs_to_process:
+            print(f"\n  Processing {len(langs_to_process)} languages in parallel...")
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                future_to_lang = {
+                    executor.submit(_process_language_wrapper, args): args[0]
+                    for args in langs_to_process
+                }
+                for future in as_completed(future_to_lang):
+                    lang_code, stats, error = future.result()
+                    if error:
+                        print(f"Error processing {lang_code}: {error}")
+                        raise RuntimeError(f"Failed to process {lang_code}: {error}")
+                    stats_by_lang[lang_code] = stats
+                    print(f"  ✓ [{lang_code}]: Completed processing")
+
+        print(f"\n  Skipped {len(langs_to_skip)} languages (already processed)")
 
         # Phase 3: Load from temp files and arrange in sets
         print("\n" + "=" * 80)
@@ -938,11 +1078,75 @@ def main():
         data_by_lang = {}
         for lang_code in LANG_CODES:
             temp_path = temp_paths[lang_code]
-            ds = load_from_disk(temp_path)
-            data_by_lang[lang_code] = ds
-            print(f"  [{lang_code}]: Loaded {len(ds):,} items")
+            try:
+                ds = load_from_disk(temp_path)
+                # Verify dataset has expected columns
+                expected_columns = {"text", "language", "source"}
+                actual_columns = set(ds.column_names)
+                missing_columns = expected_columns - actual_columns
+                if missing_columns:
+                    print(f"  Warning [{lang_code}]: Missing columns {missing_columns}")
+                    print(f"    Available columns: {actual_columns}")
+                data_by_lang[lang_code] = ds
+                print(f"  [{lang_code}]: Loaded {len(ds):,} items")
+            except Exception as e:
+                print(f"  Error loading [{lang_code}] from {temp_path}: {e}")
+                raise
 
         arranged_data, num_sets = arrange_in_sets(data_by_lang)
+
+        # Update statistics to reflect final trimmed counts
+        # Count sources per language in the final arranged data
+        final_counts_by_lang = {}
+        for lang_code in LANG_CODES:
+            final_counts_by_lang[lang_code] = {"mmarco": 0, "miracl": 0, "total": 0}
+
+        for item in arranged_data:
+            lang = item.get("language", "unknown")
+            source = item.get("source", "unknown")
+            sources = [s.strip() for s in str(source).split(",")]
+            if lang in final_counts_by_lang:
+                final_counts_by_lang[lang]["total"] += 1
+                for s in sources:
+                    if "mmarco" in s.lower():
+                        final_counts_by_lang[lang]["mmarco"] += 1
+                    elif "miracl" in s.lower():
+                        final_counts_by_lang[lang]["miracl"] += 1
+
+        # Verify all languages have the same count and it's a multiple of 13
+        counts = [final_counts_by_lang[lang]["total"] for lang in LANG_CODES]
+        if len(set(counts)) > 1:
+            print(
+                f"\nWarning: Language counts are not equal: {dict(zip(LANG_CODES, counts))}"
+            )
+        if counts[0] % NUM_LANGUAGES != 0:
+            print(
+                f"\nWarning: Total count {counts[0]} is not a multiple of {NUM_LANGUAGES}"
+            )
+        else:
+            print(
+                f"\n✓ All languages have {counts[0]:,} items (multiple of {NUM_LANGUAGES})"
+            )
+
+        # Update stats_by_lang with final counts
+        for lang_code in LANG_CODES:
+            if lang_code in stats_by_lang:
+                final_count = final_counts_by_lang.get(lang_code, {}).get("total", 0)
+                final_mmarco = final_counts_by_lang.get(lang_code, {}).get("mmarco", 0)
+                final_miracl = final_counts_by_lang.get(lang_code, {}).get("miracl", 0)
+
+                # Update used counts to match final dataset
+                stats_by_lang[lang_code]["used_mmarco"] = final_mmarco
+                stats_by_lang[lang_code]["used_miracl"] = final_miracl
+                stats_by_lang[lang_code]["total_used"] = final_count
+
+                # Recalculate unused counts
+                stats_by_lang[lang_code]["unused_mmarco"] = max(
+                    0, stats_by_lang[lang_code]["available_mmarco"] - final_mmarco
+                )
+                stats_by_lang[lang_code]["unused_miracl"] = max(
+                    0, stats_by_lang[lang_code]["available_miracl"] - final_miracl
+                )
 
         # Phase 4: Split train/val
         print("\n" + "=" * 80)
