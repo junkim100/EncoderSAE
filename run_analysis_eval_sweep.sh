@@ -48,6 +48,28 @@ if [ -z "${NUM_GPUS}" ]; then
         echo "Warning: nvidia-smi not found, defaulting to NUM_GPUS=1"
     fi
 fi
+
+# Validate and adjust NUM_GPUS for vLLM tensor parallelism
+# vLLM requires: num_attention_heads % tensor_parallel_size == 0
+# For multilingual-e5-large: 16 attention heads, so valid sizes are: 1, 2, 4, 8, 16
+VALID_TP_SIZES=(1 2 4 8 16)  # Divisors of 16 (number of attention heads)
+ORIGINAL_NUM_GPUS="${NUM_GPUS}"
+
+# Find largest valid size <= NUM_GPUS
+ADJUSTED_NUM_GPUS=1
+for size in "${VALID_TP_SIZES[@]}"; do
+    if [ "${size}" -le "${NUM_GPUS}" ]; then
+        ADJUSTED_NUM_GPUS="${size}"
+    fi
+done
+
+if [ "${ADJUSTED_NUM_GPUS}" -ne "${ORIGINAL_NUM_GPUS}" ]; then
+    echo "Warning: NUM_GPUS=${ORIGINAL_NUM_GPUS} is not compatible with model architecture (16 attention heads)"
+    echo "  Valid tensor parallel sizes: ${VALID_TP_SIZES[*]}"
+    echo "  Adjusting NUM_GPUS from ${ORIGINAL_NUM_GPUS} to ${ADJUSTED_NUM_GPUS}"
+    NUM_GPUS="${ADJUSTED_NUM_GPUS}"
+fi
+
 export NUM_GPUS
 
 ####################################################################################################

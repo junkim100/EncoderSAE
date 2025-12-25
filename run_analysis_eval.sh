@@ -64,21 +64,30 @@ MASK_PATH="analysis/${ANALYSIS_DIR_NAME}/language_features_combined_mask.pt"
 echo "================================================================================"
 echo "Step 1: Running language feature analysis..."
 echo "================================================================================"
-uv run -m EncoderSAE.analyze_main \
-    --sae_path="${SAE_PATH}" \
-    --validation_data="${VALIDATION_DATA}" \
-    --model="${MODEL_NAME}" \
-    --mask_threshold="${MASK_THRESHOLD}" \
-    --batch_size="${ANALYSIS_BATCH_SIZE}" \
-    --exclude_overlapping_features="${EXCLUDE_OVERLAPPING_FEATURES}" \
-    --use_vllm \
-    --num_gpus="${NUM_GPUS}" \
-    --gpu_memory_utilization="${GPU_MEMORY_UTILIZATION}"
 
-if [ ! -f "${MASK_PATH}" ]; then
-    echo "Error: Mask file not found at ${MASK_PATH}" >&2
-    echo "Analysis may have failed or mask path is incorrect." >&2
-    exit 1
+# Check if mask file already exists
+if [ -f "${MASK_PATH}" ]; then
+    echo "Mask file already exists at ${MASK_PATH}"
+    echo "Skipping analysis step..."
+else
+    echo "Mask file not found. Running analysis..."
+    uv run -m EncoderSAE.analyze_main \
+        --sae_path="${SAE_PATH}" \
+        --validation_data="${VALIDATION_DATA}" \
+        --model="${MODEL_NAME}" \
+        --mask_threshold="${MASK_THRESHOLD}" \
+        --batch_size="${ANALYSIS_BATCH_SIZE}" \
+        --exclude_overlapping_features="${EXCLUDE_OVERLAPPING_FEATURES}" \
+        --use_vllm \
+        --num_gpus="${NUM_GPUS}" \
+        --gpu_memory_utilization="${GPU_MEMORY_UTILIZATION}"
+
+    # Verify mask file was created
+    if [ ! -f "${MASK_PATH}" ]; then
+        echo "Error: Mask file not found at ${MASK_PATH}" >&2
+        echo "Analysis may have failed or mask path is incorrect." >&2
+        exit 1
+    fi
 fi
 
 echo ""
