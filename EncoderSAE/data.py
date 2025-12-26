@@ -661,11 +661,15 @@ def extract_activations(
                 from datasets import load_dataset
 
                 print(f"Loading dataset metadata from {dataset_path}...")
+                # Use a unique cache directory to avoid lock conflicts with multiple workers
+                import tempfile
+                cache_dir = os.path.join(tempfile.gettempdir(), f"vllm_cache_{os.getpid()}")
+                os.makedirs(cache_dir, exist_ok=True)
                 ds = load_dataset(
                     "json",
                     data_files=dataset_path,
                     split="train",
-                    cache_dir="./cache",
+                    cache_dir=cache_dir,
                     verification_mode="no_checks",
                 )
                 total_len = len(ds)
@@ -777,140 +781,164 @@ def extract_activations(
             print(f"Using vLLM with 1 GPU for activation extraction")
             print(f"Loading model: {model_name}")
 
-        try:
-            llm = LLM(
+            # In distributed mode, ensure vLLM only sees the rank's GPU to avoid NCCL conflicts
+            original_cuda_visible = None
+            if device is not None and device.type == "cuda":
+                gpu_id = device.index if device.index is not None else 0
+                # Save original CUDA_VISIBLE_DEVICES
+                original_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+                # Set to only this GPU
+                os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+                print(f"Setting CUDA_VISIBLE_DEVICES={gpu_id} for vLLM to avoid distributed training conflicts")
+
+            try:
+                llm = LLM(
                 model=model_name,
                 trust_remote_code=True,
                 enforce_eager=True,
-                tensor_parallel_size=1,
-                gpu_memory_utilization=gpu_memory_utilization,
-                max_model_len=max_length,
-                task="embed",
-            )
-        except RuntimeError as e:
-            if (
-                "multiprocessing" in str(e).lower()
-                or "cuda" in str(e).lower()
-                or "fork" in str(e).lower()
-            ):
-                raise RuntimeError(
-                    f"vLLM initialization failed: {e}\n"
-                    "This is likely a multiprocessing/CUDA issue. "
-                    "SOLUTION: Use the wrapper script: python run_main.py (instead of uv run -m EncoderSAE.main)\n"
-                    "Or ensure PYTHON_MULTIPROCESSING_START_METHOD=spawn is set before Python starts."
-                ) from e
-            raise
+                    tensor_parallel_size=1,
+                    gpu_memory_utilization=gpu_memory_utilization,
+                    max_model_len=max_length,
+                    task="embed",
+                )
+            except RuntimeError as e:
+                # Restore CUDA_VISIBLE_DEVICES on error
+                if original_cuda_visible is not None:
+                    if original_cuda_visible:
+                        os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible
+                    else:
+                        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                if (
+                    "multiprocessing" in str(e).lower()
+                    or "cuda" in str(e).lower()
+                    or "fork" in str(e).lower()
+                ):
+                    raise RuntimeError(
+                        f"vLLM initialization failed: {e}\n"
+                        "This is likely a multiprocessing/CUDA issue. "
+                        "SOLUTION: Use the wrapper script: python run_main.py (instead of uv run -m EncoderSAE.main)\n"
+                        "Or ensure PYTHON_MULTIPROCESSING_START_METHOD=spawn is set before Python starts."
+                    ) from e
+                raise
 
-        print(f"Extracting activations for {len(texts)} samples using vLLM...")
+            try:
+                print(f"Extracting activations for {len(texts)} samples using vLLM...")
 
-        # Collect all activations in a list
-        all_activations = []
+                # Collect all activations in a list
+                all_activations = []
 
-        # Process in batches
-        num_batches = (len(texts) + batch_size - 1) // batch_size
+                # Process in batches
+                num_batches = (len(texts) + batch_size - 1) // batch_size
 
-        for batch_idx in tqdm(
-            range(num_batches), desc="Activations (vLLM)", total=num_batches
-        ):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, len(texts))
-            batch_texts = texts[start_idx:end_idx]
+                for batch_idx in tqdm(
+                    range(num_batches), desc="Activations (vLLM)", total=num_batches
+                ):
+                    start_idx = batch_idx * batch_size
+                    end_idx = min(start_idx + batch_size, len(texts))
+                    batch_texts = texts[start_idx:end_idx]
 
-            # Get embeddings from vLLM using encode() API
-            # Use llm.encode() instead of llm.embed() for better performance
-            outputs = llm.encode(batch_texts, pooling_task="embed", use_tqdm=False)
+                    # Get embeddings from vLLM using encode() API
+                    # Use llm.encode() instead of llm.embed() for better performance
+                    outputs = llm.encode(batch_texts, pooling_task="embed", use_tqdm=False)
 
-            # Extract embedding tensors with fallback logic
-            for output in outputs:
-                embedding_tensor = None
+                    # Extract embedding tensors with fallback logic
+                    for output in outputs:
+                        embedding_tensor = None
 
-                # Try multiple extraction paths (fallback logic)
-                if hasattr(output, "outputs"):
-                    if hasattr(output.outputs, "embedding"):
-                        embedding_data = output.outputs.embedding
-                        embedding_tensor = (
-                            torch.tensor(embedding_data, dtype=torch.float32)
-                            if not isinstance(embedding_data, torch.Tensor)
-                            else embedding_data.to(dtype=torch.float32)
-                        )
-                    elif hasattr(output.outputs, "data"):
-                        embedding_data = output.outputs.data
-                        embedding_tensor = (
-                            torch.tensor(embedding_data, dtype=torch.float32)
-                            if not isinstance(embedding_data, torch.Tensor)
-                            else embedding_data.to(dtype=torch.float32)
-                        )
-                    elif hasattr(output.outputs, "__len__") and not isinstance(
-                        output.outputs, str
-                    ):
-                        if len(output.outputs) > 0:
-                            if hasattr(output.outputs[0], "embedding"):
-                                embedding_data = output.outputs[0].embedding
-                            elif hasattr(output.outputs[0], "data"):
-                                embedding_data = output.outputs[0].data
-                            else:
-                                embedding_data = output.outputs[0]
+                        # Try multiple extraction paths (fallback logic)
+                        if hasattr(output, "outputs"):
+                            if hasattr(output.outputs, "embedding"):
+                                embedding_data = output.outputs.embedding
+                                embedding_tensor = (
+                                    torch.tensor(embedding_data, dtype=torch.float32)
+                                    if not isinstance(embedding_data, torch.Tensor)
+                                    else embedding_data.to(dtype=torch.float32)
+                                )
+                            elif hasattr(output.outputs, "data"):
+                                embedding_data = output.outputs.data
+                                embedding_tensor = (
+                                    torch.tensor(embedding_data, dtype=torch.float32)
+                                    if not isinstance(embedding_data, torch.Tensor)
+                                    else embedding_data.to(dtype=torch.float32)
+                                )
+                            elif hasattr(output.outputs, "__len__") and not isinstance(
+                                output.outputs, str
+                            ):
+                                if len(output.outputs) > 0:
+                                    if hasattr(output.outputs[0], "embedding"):
+                                        embedding_data = output.outputs[0].embedding
+                                    elif hasattr(output.outputs[0], "data"):
+                                        embedding_data = output.outputs[0].data
+                                    else:
+                                        embedding_data = output.outputs[0]
+                                    embedding_tensor = (
+                                        torch.tensor(embedding_data, dtype=torch.float32)
+                                        if not isinstance(embedding_data, torch.Tensor)
+                                        else embedding_data.to(dtype=torch.float32)
+                                    )
+                                else:
+                                    raise ValueError("EmbeddingRequestOutput.outputs is empty")
+                        elif hasattr(output, "embedding"):
+                            embedding_data = output.embedding
                             embedding_tensor = (
                                 torch.tensor(embedding_data, dtype=torch.float32)
                                 if not isinstance(embedding_data, torch.Tensor)
                                 else embedding_data.to(dtype=torch.float32)
                             )
+                        elif isinstance(output, torch.Tensor):
+                            embedding_tensor = output.to(dtype=torch.float32)
+                        elif hasattr(output, "__array__"):
+                            import numpy as np
+
+                            embedding_tensor = torch.from_numpy(np.array(output)).to(
+                                dtype=torch.float32
+                            )
                         else:
-                            raise ValueError("EmbeddingRequestOutput.outputs is empty")
-                elif hasattr(output, "embedding"):
-                    embedding_data = output.embedding
-                    embedding_tensor = (
-                        torch.tensor(embedding_data, dtype=torch.float32)
-                        if not isinstance(embedding_data, torch.Tensor)
-                        else embedding_data.to(dtype=torch.float32)
-                    )
-                elif isinstance(output, torch.Tensor):
-                    embedding_tensor = output.to(dtype=torch.float32)
-                elif hasattr(output, "__array__"):
-                    import numpy as np
+                            try:
+                                embedding_tensor = torch.tensor(output, dtype=torch.float32)
+                            except:
+                                raise ValueError(
+                                    f"Cannot extract embedding from {type(output)}. "
+                                    f"Available attributes: {[attr for attr in dir(output) if not attr.startswith('_')]}"
+                                )
 
-                    embedding_tensor = torch.from_numpy(np.array(output)).to(
-                        dtype=torch.float32
-                    )
-                else:
-                    try:
-                        embedding_tensor = torch.tensor(output, dtype=torch.float32)
-                    except:
-                        raise ValueError(
-                            f"Cannot extract embedding from {type(output)}. "
-                            f"Available attributes: {[attr for attr in dir(output) if not attr.startswith('_')]}"
-                        )
+                            if embedding_tensor is None:
+                                raise ValueError(
+                                    f"Failed to extract embedding from {type(output)}"
+                                )
 
-                    if embedding_tensor is None:
-                        raise ValueError(
-                            f"Failed to extract embedding from {type(output)}"
-                        )
+                            # Ensure it's float32 and on CPU
+                            if not isinstance(embedding_tensor, torch.Tensor):
+                                embedding_tensor = torch.tensor(
+                                    embedding_tensor, dtype=torch.float32
+                                )
 
-                    # Ensure it's float32 and on CPU
-                    if not isinstance(embedding_tensor, torch.Tensor):
-                        embedding_tensor = torch.tensor(
-                            embedding_tensor, dtype=torch.float32
-                        )
+                            if embedding_tensor.dtype != torch.float32:
+                                embedding_tensor = embedding_tensor.to(dtype=torch.float32)
 
-                    if embedding_tensor.dtype != torch.float32:
-                        embedding_tensor = embedding_tensor.to(dtype=torch.float32)
+                        all_activations.append(embedding_tensor.cpu())
 
-                    all_activations.append(embedding_tensor.cpu())
+                # Stack all activations into a single tensor and save
+                activations_tensor = torch.stack(all_activations)
 
-            # Stack all activations into a single tensor and save
-            activations_tensor = torch.stack(all_activations)
+                # Generate filename: {model_short}.pt
+                model_short = (
+                    Path(model_name).stem
+                    if os.path.exists(model_name)
+                    else model_name.replace("/", "_")
+                )
+                output_file = output_path / f"{model_short}.pt"
 
-            # Generate filename: {model_short}.pt
-            model_short = (
-                Path(model_name).stem
-                if os.path.exists(model_name)
-                else model_name.replace("/", "_")
-            )
-            output_file = output_path / f"{model_short}.pt"
-
-            torch.save(activations_tensor, output_file)
-            print(f"Saved {len(all_activations)} activations to {output_file}")
-            return str(output_file)
+                torch.save(activations_tensor, output_file)
+                print(f"Saved {len(all_activations)} activations to {output_file}")
+                return str(output_file)
+            finally:
+                # Restore original CUDA_VISIBLE_DEVICES
+                if original_cuda_visible is not None:
+                    if original_cuda_visible:
+                        os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible
+                    else:
+                        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
     if num_gpus <= 1:
         # Single GPU path (original implementation)

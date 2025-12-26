@@ -242,7 +242,20 @@ def main(
                 # (unreachable) keep for clarity
                 pass
             # Wait for rank 0 to extract/write the cache.
-            dist.barrier()
+            # Use file-based waiting instead of barrier to avoid timeout during long dataset loading
+            import time
+
+            wait_interval = 2  # Check every 2 seconds
+            waited = 0
+            print(f"[Rank {rank}] Waiting for activations file: {activations_file}")
+            while not activations_file.exists():
+                time.sleep(wait_interval)
+                waited += wait_interval
+                if waited % (10 * 60) == 0:  # Print every 10 minutes
+                    print(
+                        f"[Rank {rank}] Still waiting for activations file... ({waited}s elapsed)"
+                    )
+            print(f"[Rank {rank}] Found activations file, loading dataset...")
             train_dataset = ActivationDataset(str(activations_file))
         else:
             # Load data
@@ -256,6 +269,18 @@ def main(
             if save_activations:
                 if is_main_process:
                     print("Extracting activations...")
+
+                # Temporarily destroy DDP to avoid NCCL conflicts with vLLM
+                # vLLM will use its own multi-GPU setup (one instance per GPU)
+                ddp_was_initialized = False
+                if is_distributed and dist.is_initialized():
+                    ddp_was_initialized = True
+                    if is_main_process:
+                        print(
+                            "Temporarily destroying DDP process group for vLLM multi-GPU extraction..."
+                        )
+                    dist.destroy_process_group()
+
                 # For vLLM multi-GPU, pass dataset path for on-demand loading
                 # For other paths, pass texts (already loaded)
                 dataset_path_for_extraction = (
@@ -268,8 +293,12 @@ def main(
                     )
                     else None
                 )
-                # If we're already running under torchrun, do NOT fan out across all GPUs again.
-                extraction_num_gpus = 1 if is_distributed else num_gpus
+                # Use all GPUs for vLLM extraction (vLLM handles multi-GPU internally)
+                extraction_num_gpus = (
+                    num_gpus
+                    if num_gpus
+                    else (torch.cuda.device_count() if torch.cuda.is_available() else 1)
+                )
                 activations_file = Path(
                     extract_activations(
                         model_name=model,
@@ -286,15 +315,26 @@ def main(
                     )
                 )
                 train_dataset = ActivationDataset(str(activations_file))
+
+                # Re-initialize DDP after vLLM extraction is complete
+                if ddp_was_initialized:
+                    if is_main_process:
+                        print(
+                            "Re-initializing DDP process group after vLLM extraction..."
+                        )
+                    backend = "nccl" if torch.cuda.is_available() else "gloo"
+                    dist.init_process_group(backend=backend, init_method="env://")
+                    rank = dist.get_rank()
+                    world_size = dist.get_world_size()
+                    is_main_process = rank == 0
             else:
                 # Extract on-the-fly (not recommended for large datasets)
                 raise NotImplementedError(
                     "On-the-fly activation extraction not implemented. Use save_activations=True."
                 )
 
-            # Let other ranks proceed to load the now-written cache.
-            if is_distributed:
-                dist.barrier()
+            # Other ranks are waiting for the file to exist (file-based synchronization)
+            # No need for barrier since we're using file-based waiting
 
     # Prepare validation dataset (optional separate dataset)
     val_dataset_obj = None
