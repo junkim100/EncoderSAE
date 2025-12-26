@@ -3,7 +3,7 @@ name = "encodersae"
 version = "0.1.0"
 description = "Sparse Autoencoder for Encoder-only Models"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 dependencies = [
     "torch>=2.0.0",
     "transformers>=4.30.0",
