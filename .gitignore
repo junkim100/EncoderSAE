@@ -32,6 +32,7 @@ wandb/
 data/**/*.json*
 cache/
 analysis/
+*.log
 
 # Results
 results_base/
