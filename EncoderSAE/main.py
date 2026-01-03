@@ -53,6 +53,128 @@ def _activation_collate(batch):
     return torch.stack(batch, dim=0)
 
 
+def _ensure_writable_dir(path: Path, *, allow_fallback: bool) -> Path:
+    """
+    Ensure `path` exists and is writable by the current user.
+
+    In shared environments it's common for a previous run (different user) to
+    have created `./activations/...` with restrictive permissions (e.g. 755),
+    which makes activation extraction fail mid-run with PermissionError.
+
+    If `allow_fallback` is True, we fall back to a sibling directory with a uid
+    suffix under the same parent.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    test_path = path / f".write_test_{os.getpid()}"
+    try:
+        with open(test_path, "w", encoding="utf-8") as f:
+            f.write("ok\n")
+        test_path.unlink(missing_ok=True)
+        return path
+    except Exception as e:
+        try:
+            test_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        if not allow_fallback:
+            raise PermissionError(
+                f"Directory is not writable: {path}. "
+                "Please choose a writable --activations_dir (or fix permissions)."
+            ) from e
+
+        fallback = path.parent / f"{path.name}__uid{os.getuid()}"
+        fallback.mkdir(parents=True, exist_ok=True)
+        fallback_test = fallback / f".write_test_{os.getpid()}"
+        try:
+            with open(fallback_test, "w", encoding="utf-8") as f:
+                f.write("ok\n")
+            fallback_test.unlink(missing_ok=True)
+        except Exception as e2:
+            raise PermissionError(
+                f"Neither {path} nor fallback {fallback} is writable. "
+                "Please choose a writable --activations_dir (or fix permissions)."
+            ) from e2
+
+        print(
+            f"WARNING: activations_dir {path} is not writable; using {fallback} instead.",
+            flush=True,
+        )
+        return fallback
+
+
+def _run_activation_cache_subprocess(
+    *,
+    model: str,
+    dataset: str,
+    text_column: str,
+    activations_dir: str,
+    activation_batch_size: int,
+    max_length: int,
+    max_samples: Optional[int],
+    num_gpus: Optional[int],
+    use_vllm: bool,
+    gpu_memory_utilization: float,
+    dataset_num_samples: Optional[int] = None,
+) -> None:
+    """
+    Run activation caching in an isolated subprocess (no torchrun/DDP env),
+    because vLLM + multiprocessing can deadlock when invoked directly inside a
+    torchrun-launched rank process.
+    """
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    # Strip torchrun/DDP variables (and other common dist vars) so the subprocess
+    # looks like a plain single-process job.
+    for k in list(env.keys()):
+        if k in {
+            "MASTER_ADDR",
+            "MASTER_PORT",
+            "RANK",
+            "WORLD_SIZE",
+            "LOCAL_RANK",
+            "GROUP_RANK",
+            "ROLE_RANK",
+            "ROLE_NAME",
+            "LOCAL_WORLD_SIZE",
+            "TORCHELASTIC_RUN_ID",
+            "TORCHELASTIC_RESTART_COUNT",
+            "TORCHELASTIC_MAX_RESTARTS",
+            "TORCH_DIST_INIT_BARRIER",
+        } or k.startswith("TORCHELASTIC_"):
+            env.pop(k, None)
+
+    env.setdefault("PYTHON_MULTIPROCESSING_START_METHOD", "spawn")
+    # vLLM safety defaults
+    env.setdefault("VLLM_HOST_IP", "127.0.0.1")
+    env.setdefault("VLLM_LOOPBACK_IP", "127.0.0.1")
+    env.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "EncoderSAE.activation_cache",
+        f"--model={model}",
+        f"--dataset={dataset}",
+        f"--text_column={text_column}",
+        f"--activations_dir={activations_dir}",
+        f"--activation_batch_size={int(activation_batch_size)}",
+        f"--max_length={int(max_length)}",
+        f"--use_vllm={bool(use_vllm)}",
+        f"--gpu_memory_utilization={float(gpu_memory_utilization)}",
+    ]
+    if max_samples is not None:
+        cmd.append(f"--max_samples={int(max_samples)}")
+    if dataset_num_samples is not None:
+        cmd.append(f"--dataset_num_samples={int(dataset_num_samples)}")
+    if num_gpus is not None:
+        cmd.append(f"--num_gpus={int(num_gpus)}")
+
+    subprocess.run(cmd, env=env, check=True)
+
+
 class _DistributedReplacementSampler(torch.utils.data.Sampler[int]):
     """
     Distributed sampler that samples with replacement (uses randint) so it does
@@ -129,6 +251,8 @@ def main(
     save_dir: Optional[str] = None,
     max_length: int = 512,
     max_samples: Optional[int] = None,
+    dataset_num_samples: Optional[int] = None,
+    val_dataset_num_samples: Optional[int] = None,
     num_gpus: Optional[int] = None,
     use_vllm: bool = True,
     gpu_memory_utilization: float = 0.9,
@@ -217,15 +341,31 @@ def main(
     )
 
     # Determine activations file path (always set, but overridable)
+    activations_dir_was_default = activations_dir is None
     if activations_dir is None:
         activations_dir = f"./activations/{model_short}_{dataset_short}"
 
     # Create directory if it doesn't exist
-    activations_dir_path = Path(activations_dir)
-    activations_dir_path.mkdir(parents=True, exist_ok=True)
+    activations_dir_path = _ensure_writable_dir(
+        Path(activations_dir), allow_fallback=activations_dir_was_default
+    )
 
-    # Generate activation file path: {model_short}.pt
-    activations_file = activations_dir_path / f"{model_short}.pt"
+    # Activation cache paths:
+    # - vLLM path writes a streaming .npy memmap by default (memory-safe)
+    # - legacy path may have a .pt tensor cache
+    activations_file_pt = activations_dir_path / f"{model_short}.pt"
+    activations_file_npy = activations_dir_path / f"{model_short}.npy"
+
+    preferred_activations_file = activations_file_npy if use_vllm else activations_file_pt
+    fallback_activations_file = activations_file_pt if preferred_activations_file == activations_file_npy else activations_file_npy
+
+    # Pick an existing cache if present (prevents waiting forever if format differs).
+    if preferred_activations_file.exists():
+        activations_file = preferred_activations_file
+    elif fallback_activations_file.exists():
+        activations_file = fallback_activations_file
+    else:
+        activations_file = preferred_activations_file
 
     # Determine batch size for activation extraction (can differ from training batch size)
     activation_bs = activation_batch_size or batch_size
@@ -244,13 +384,80 @@ def main(
             # Wait for rank 0 to extract/write the cache.
             # Use file-based waiting instead of barrier to avoid timeout during long dataset loading
             import time
+            import json
 
             wait_interval = 2  # Check every 2 seconds
             waited = 0
             print(f"[Rank {rank}] Waiting for activations file: {activations_file}")
+            progress_file = activations_dir_path / f"{model_short}.progress.json"
+            error_file = activations_dir_path / f"{model_short}.error.txt"
+            # To avoid spamming logs from every rank, only one rank prints detailed progress.
+            progress_rank = int(os.environ.get("ENCODERSAE_PROGRESS_RANK", "1"))
+            progress_interval_s = int(
+                os.environ.get("ENCODERSAE_PROGRESS_INTERVAL_SECONDS", "60")
+            )
+            last_progress_print = 0
+            last_seen_done = None
             while not activations_file.exists():
                 time.sleep(wait_interval)
                 waited += wait_interval
+                # If the cache subprocess failed, surface the error early instead of waiting forever.
+                if error_file.exists():
+                    try:
+                        err = error_file.read_text(encoding="utf-8")
+                    except Exception:
+                        err = "<failed to read error file>"
+                    raise RuntimeError(
+                        f"Activation cache failed. See {error_file}.\n\n{err}"
+                    )
+
+                if (
+                    rank == progress_rank
+                    and progress_file.exists()
+                    and (waited - last_progress_print) >= progress_interval_s
+                ):
+                    last_progress_print = waited
+                    try:
+                        payload = json.loads(progress_file.read_text(encoding="utf-8"))
+                    except Exception:
+                        payload = None
+
+                    if isinstance(payload, dict):
+                        stage = payload.get("stage", "unknown")
+                        done = payload.get("done", 0)
+                        total = payload.get("total", 0)
+                        # Avoid spam when the progress file hasn't changed.
+                        if last_seen_done is not None and done == last_seen_done:
+                            continue
+                        last_seen_done = done
+                        pct = (
+                            (float(done) * 100.0 / float(total))
+                            if isinstance(done, (int, float))
+                            and isinstance(total, (int, float))
+                            and float(total) > 0
+                            else None
+                        )
+                        sps = payload.get("samples_per_sec", None)
+                        eta = payload.get("eta_seconds", None)
+                        eta_str = (
+                            f"{int(float(eta) // 3600)}h{int((float(eta) % 3600) // 60)}m{int(float(eta) % 60)}s"
+                            if isinstance(eta, (int, float))
+                            else "?"
+                        )
+                        if pct is not None:
+                            msg = (
+                                f"[Rank {rank}] Activation cache {stage}: "
+                                f"{int(done):,}/{int(total):,} ({pct:.2f}%)"
+                            )
+                        else:
+                            msg = (
+                                f"[Rank {rank}] Activation cache {stage}: "
+                                f"{done}/{total}"
+                            )
+                        if isinstance(sps, (int, float)) and float(sps) > 0:
+                            msg += f" @ {float(sps):,.0f} samples/s, ETA {eta_str}"
+                        print(msg, flush=True)
+
                 if waited % (10 * 60) == 0:  # Print every 10 minutes
                     print(
                         f"[Rank {rank}] Still waiting for activations file... ({waited}s elapsed)"
@@ -258,75 +465,87 @@ def main(
             print(f"[Rank {rank}] Found activations file, loading dataset...")
             train_dataset = ActivationDataset(str(activations_file))
         else:
-            # Load data
+            # Load data (or stream from disk for vLLM).
             if is_main_process:
                 print(f"Loading dataset: {dataset}")
-            texts = load_data(dataset, text_column=text_column, max_samples=max_samples)
-            if is_main_process:
-                print(f"Loaded {len(texts)} samples")
+
+            if use_vllm and os.path.exists(dataset):
+                # Avoid holding huge datasets in RAM: let `extract_activations` stream from disk.
+                texts = []
+                dataset_path_for_extraction = dataset
+                if is_main_process:
+                    print(
+                        "vLLM enabled and dataset is a local file; "
+                        "skipping full in-RAM load and streaming from disk for activation extraction."
+                    )
+            else:
+                texts = load_data(dataset, text_column=text_column, max_samples=max_samples)
+                dataset_path_for_extraction = None
+                if is_main_process:
+                    print(f"Loaded {len(texts)} samples")
 
             # Extract activations
             if save_activations:
                 if is_main_process:
                     print("Extracting activations...")
 
-                # Temporarily destroy DDP to avoid NCCL conflicts with vLLM
-                # vLLM will use its own multi-GPU setup (one instance per GPU)
-                ddp_was_initialized = False
-                if is_distributed and dist.is_initialized():
-                    ddp_was_initialized = True
+                # vLLM + multiprocessing is reliable in a clean subprocess, but
+                # can deadlock when invoked directly inside a torchrun rank.
+                if is_distributed and use_vllm:
                     if is_main_process:
                         print(
-                            "Temporarily destroying DDP process group for vLLM multi-GPU extraction..."
+                            "Running activation extraction in an isolated subprocess (torchrun-safe)...",
+                            flush=True,
                         )
-                    dist.destroy_process_group()
-
-                # For vLLM multi-GPU, pass dataset path for on-demand loading
-                # For other paths, pass texts (already loaded)
-                dataset_path_for_extraction = (
-                    dataset
-                    if (
-                        use_vllm
-                        and num_gpus
-                        and num_gpus > 1
-                        and os.path.exists(dataset)
+                        _run_activation_cache_subprocess(
+                            model=model,
+                            dataset=dataset,
+                            text_column=text_column,
+                            activations_dir=str(activations_dir_path),
+                            activation_batch_size=activation_bs,
+                            max_length=max_length,
+                            max_samples=max_samples,
+                            dataset_num_samples=dataset_num_samples,
+                            num_gpus=num_gpus,
+                            use_vllm=use_vllm,
+                            gpu_memory_utilization=gpu_memory_utilization,
+                        )
+                    # Refresh cache path choice (npy vs pt) after subprocess.
+                    if activations_file_pt.exists():
+                        activations_file = activations_file_pt
+                    if activations_file_npy.exists():
+                        activations_file = activations_file_npy
+                    if not activations_file.exists():
+                        raise RuntimeError(
+                            f"Activation cache was not created: {activations_file}"
+                        )
+                else:
+                    # Non-DDP or non-vLLM: run in-process.
+                    extraction_num_gpus = (
+                        num_gpus
+                        if num_gpus
+                        else (
+                            torch.cuda.device_count() if torch.cuda.is_available() else 1
+                        )
                     )
-                    else None
-                )
-                # Use all GPUs for vLLM extraction (vLLM handles multi-GPU internally)
-                extraction_num_gpus = (
-                    num_gpus
-                    if num_gpus
-                    else (torch.cuda.device_count() if torch.cuda.is_available() else 1)
-                )
-                activations_file = Path(
-                    extract_activations(
-                        model_name=model,
-                        texts=texts,
-                        output_dir=str(activations_dir_path),
-                        batch_size=activation_bs,
-                        max_length=max_length,
-                        device=device,
-                        num_gpus=extraction_num_gpus,
-                        use_vllm=use_vllm,
-                        gpu_memory_utilization=gpu_memory_utilization,
-                        dataset_path=dataset_path_for_extraction,
-                        text_column=text_column,
+                    activations_file = Path(
+                        extract_activations(
+                            model_name=model,
+                            texts=texts,
+                            output_dir=str(activations_dir_path),
+                            batch_size=activation_bs,
+                            max_length=max_length,
+                            device=device,
+                            num_gpus=extraction_num_gpus,
+                            use_vllm=use_vllm,
+                            gpu_memory_utilization=gpu_memory_utilization,
+                            dataset_path=dataset_path_for_extraction,
+                            text_column=text_column,
+                            max_samples=max_samples,
+                            total_samples=dataset_num_samples,
+                        )
                     )
-                )
                 train_dataset = ActivationDataset(str(activations_file))
-
-                # Re-initialize DDP after vLLM extraction is complete
-                if ddp_was_initialized:
-                    if is_main_process:
-                        print(
-                            "Re-initializing DDP process group after vLLM extraction..."
-                        )
-                    backend = "nccl" if torch.cuda.is_available() else "gloo"
-                    dist.init_process_group(backend=backend, init_method="env://")
-                    rank = dist.get_rank()
-                    world_size = dist.get_world_size()
-                    is_main_process = rank == 0
             else:
                 # Extract on-the-fly (not recommended for large datasets)
                 raise NotImplementedError(
@@ -347,12 +566,29 @@ def main(
             else val_dataset.replace("/", "_")
         )
         # Use dataset-based suffix only; do not append extra "_val"
+        # Ensure directory is writable (shared environments may have stale dirs owned by another user).
         val_activations_dir = f"./activations/{val_model_short}_{val_dataset_short}"
-        val_activations_dir_path = Path(val_activations_dir)
-        val_activations_dir_path.mkdir(parents=True, exist_ok=True)
+        val_activations_dir_path = _ensure_writable_dir(
+            Path(val_activations_dir), allow_fallback=True
+        )
 
-        # Generate validation activation file path: {model_short}.pt
-        val_activations_file = val_activations_dir_path / f"{val_model_short}.pt"
+        # Validation activation cache paths (prefer .npy for vLLM, fall back to .pt).
+        val_activations_file_pt = val_activations_dir_path / f"{val_model_short}.pt"
+        val_activations_file_npy = val_activations_dir_path / f"{val_model_short}.npy"
+
+        preferred_val_file = val_activations_file_npy if use_vllm else val_activations_file_pt
+        fallback_val_file = (
+            val_activations_file_pt
+            if preferred_val_file == val_activations_file_npy
+            else val_activations_file_npy
+        )
+
+        if preferred_val_file.exists():
+            val_activations_file = preferred_val_file
+        elif fallback_val_file.exists():
+            val_activations_file = fallback_val_file
+        else:
+            val_activations_file = preferred_val_file
 
         if save_activations and val_activations_file.exists():
             if is_main_process:
@@ -363,56 +599,154 @@ def main(
         else:
             # In DDP mode, avoid multiple ranks extracting the same validation cache.
             if is_distributed and not is_main_process:
-                dist.barrier()
+                # Use file-based waiting instead of barrier to avoid timeout during long extraction
+                import time
+                import json
+
+                wait_interval = 2  # Check every 2 seconds
+                waited = 0
+                print(f"[Rank {rank}] Waiting for validation activations file: {val_activations_file}")
+                val_progress_file = val_activations_dir_path / f"{val_model_short}.progress.json"
+                val_error_file = val_activations_dir_path / f"{val_model_short}.error.txt"
+                # To avoid spamming logs from every rank, only one rank prints detailed progress.
+                progress_rank = int(os.environ.get("ENCODERSAE_PROGRESS_RANK", "1"))
+                progress_interval_s = int(
+                    os.environ.get("ENCODERSAE_PROGRESS_INTERVAL_SECONDS", "60")
+                )
+                last_progress_print = 0
+                last_seen_done = None
+                while not val_activations_file.exists():
+                    # Check for errors
+                    if val_error_file.exists():
+                        with open(val_error_file, "r", encoding="utf-8") as f:
+                            error_msg = f.read()
+                        raise RuntimeError(
+                            f"Validation activation extraction failed: {error_msg}"
+                        )
+
+                    # Print progress if available
+                    if val_progress_file.exists():
+                        try:
+                            with open(val_progress_file, "r", encoding="utf-8") as f:
+                                progress = json.load(f)
+                            if rank == progress_rank:
+                                now = time.time()
+                                if (now - last_progress_print) >= progress_interval_s:
+                                    done = progress.get("done", 0)
+                                    total = progress.get("total", 0)
+                                    percent = progress.get("percent", 0.0)
+                                    stage = progress.get("stage", "unknown")
+                                    samples_per_sec = progress.get("samples_per_sec")
+                                    eta_seconds = progress.get("eta_seconds", 0.0)
+
+                                    if done != last_seen_done:
+                                        eta_str = (
+                                            f", ETA {int(eta_seconds // 3600)}h{int((eta_seconds % 3600) // 60)}m{int(eta_seconds % 60)}s"
+                                            if eta_seconds > 0
+                                            else ""
+                                        )
+                                        samples_str = (
+                                            f" @ {samples_per_sec:.0f} samples/s"
+                                            if samples_per_sec
+                                            else ""
+                                        )
+                                        print(
+                                            f"[Rank {rank}] Validation activation cache {stage}: {done:,}/{total:,} ({percent:.2f}%){samples_str}{eta_str}",
+                                            flush=True,
+                                        )
+                                        last_seen_done = done
+                                        last_progress_print = now
+                        except Exception:
+                            pass  # Ignore JSON parse errors
+
+                    time.sleep(wait_interval)
+                    waited += wait_interval
+                    if waited % 60 == 0:  # Print every minute
+                        print(
+                            f"[Rank {rank}] Still waiting for validation activations file... ({waited}s elapsed)",
+                            flush=True,
+                        )
+
                 val_dataset_obj = ActivationDataset(str(val_activations_file))
             else:
                 if is_main_process:
                     print(f"Loading validation dataset: {val_dataset}")
-                val_texts = load_data(
-                    val_dataset, text_column=text_column, max_samples=max_samples
-                )
-                if is_main_process:
-                    print(f"Loaded {len(val_texts)} validation samples")
+
+                # Load validation texts (or stream from disk for vLLM).
+                if use_vllm and os.path.exists(val_dataset):
+                    val_texts = []
+                    val_dataset_path_for_extraction = val_dataset
+                    if is_main_process:
+                        print(
+                            "vLLM enabled and val_dataset is a local file; "
+                            "skipping full in-RAM load and streaming from disk for validation activation extraction."
+                        )
+                else:
+                    val_texts = load_data(
+                        val_dataset, text_column=text_column, max_samples=max_samples
+                    )
+                    val_dataset_path_for_extraction = None
+                    if is_main_process:
+                        print(f"Loaded {len(val_texts)} validation samples")
 
                 if save_activations:
                     if is_main_process:
                         print("Extracting validation activations...")
-                    # For vLLM multi-GPU, pass dataset path for on-demand loading
-                    val_dataset_path_for_extraction = (
-                        val_dataset
-                        if (
-                            use_vllm
-                            and num_gpus
-                            and num_gpus > 1
-                            and os.path.exists(val_dataset)
+
+                    if is_distributed and use_vllm:
+                        # torchrun-safe extraction
+                        if is_main_process:
+                            _run_activation_cache_subprocess(
+                                model=model,
+                                dataset=val_dataset,
+                                text_column=text_column,
+                                activations_dir=str(val_activations_dir_path),
+                                activation_batch_size=activation_bs,
+                                max_length=max_length,
+                                max_samples=max_samples,
+                                dataset_num_samples=val_dataset_num_samples,
+                                num_gpus=num_gpus,
+                                use_vllm=use_vllm,
+                                gpu_memory_utilization=gpu_memory_utilization,
+                            )
+                        dist.barrier()
+                        # Refresh after subprocess (npy vs pt)
+                        if val_activations_file_pt.exists():
+                            val_activations_file = val_activations_file_pt
+                        if val_activations_file_npy.exists():
+                            val_activations_file = val_activations_file_npy
+                        if not val_activations_file.exists():
+                            raise RuntimeError(
+                                f"Validation activation cache was not created: {val_activations_file}"
+                            )
+                        val_dataset_obj = ActivationDataset(str(val_activations_file))
+                    else:
+                        extraction_num_gpus = 1 if is_distributed else num_gpus
+                        val_activations_file = Path(
+                            extract_activations(
+                                model_name=model,
+                                texts=val_texts,
+                                output_dir=str(val_activations_dir_path),
+                                batch_size=activation_bs,
+                                max_length=max_length,
+                                device=device,
+                                num_gpus=extraction_num_gpus,
+                                use_vllm=use_vllm,
+                                gpu_memory_utilization=gpu_memory_utilization,
+                                dataset_path=val_dataset_path_for_extraction,
+                                text_column=text_column,
+                                max_samples=max_samples,
+                                total_samples=val_dataset_num_samples,
+                            )
                         )
-                        else None
-                    )
-                    extraction_num_gpus = 1 if is_distributed else num_gpus
-                    val_activations_file = Path(
-                        extract_activations(
-                            model_name=model,
-                            texts=val_texts,
-                            output_dir=str(val_activations_dir_path),
-                            batch_size=activation_bs,
-                            max_length=max_length,
-                            device=device,
-                            num_gpus=extraction_num_gpus,
-                            use_vllm=use_vllm,
-                            gpu_memory_utilization=gpu_memory_utilization,
-                            dataset_path=val_dataset_path_for_extraction,
-                            text_column=text_column,
-                        )
-                    )
-                    val_dataset_obj = ActivationDataset(str(val_activations_file))
+                        val_dataset_obj = ActivationDataset(str(val_activations_file))
+                        if is_distributed:
+                            dist.barrier()
                 else:
                     raise NotImplementedError(
                         "On-the-fly validation activation extraction not implemented. "
                         "Use save_activations=True."
                     )
-
-                if is_distributed:
-                    dist.barrier()
 
     # Split train/val
     if val_dataset_obj is not None:

@@ -3,34 +3,42 @@ set -euo pipefail
 
 # Model and dataset configuration
 MODEL="intfloat/multilingual-e5-large"
-DATASET="data/4lang_train.jsonl"
-VAL_DATASET="data/4lang_validation.jsonl"
+DATASET="data/train.jsonl"
+VAL_DATASET="data/val.jsonl"
+# Optional: provide known dataset sizes to avoid scanning huge JSONL files.
+# (These are used to pre-allocate the streaming .npy activation cache.)
+DATASET_NUM_SAMPLES=124467499
+VAL_DATASET_NUM_SAMPLES=31116878
 
 # Training configuration
-VAL_STEP=50                    # Run validation every N steps
-BASE_BATCH_SIZE=294912        # Base batch size for expansion factor 32 (scales down for larger factors)
+VAL_STEP=50                   # Run validation every N steps
+BASE_BATCH_SIZE=585728        # Base batch size for expansion factor 32 (scales down for larger factors). Multiple of 13 for balanced batch for all 13 languages.
+                              # Increased from 292864 to better utilize GPU memory (was at ~38.7% usage)
 GRAD_ACC_STEPS=1              # Gradient accumulation steps
-LOG_STEPS=5                    # Log metrics every N steps
+LOG_STEPS=5                   # Log metrics every N steps
 CHECKPOINT_STEPS=50           # Save checkpoint every N steps
-NUM_GPUS=2                     # Number of GPUs for distributed training
+NUM_GPUS=8                    # Number of GPUs for distributed training
 GPU_MEM_UTIL=0.95             # GPU memory utilization for vLLM (0.0-1.0)
+# Activation extraction configuration (vLLM encode batch size).
+# Tune this to drive GPU utilization during activation creation without affecting SAE training batch size.
+ACTIVATION_BATCH_SIZE=262144
 
 # Model architecture
 INPUT_DIM=1024                 # Input dimension (must match encoder model output)
 
 # Hyperparameter sweep ranges
-EXPANSION_FACTORS=(32 64 128)  # Dictionary size = INPUT_DIM * expansion_factor
-SPARSITY_RATIOS=(0.005 0.01 0.02 0.03)  # Sparsity k = dict_size * ratio (rounded to nearest 1024)
-LRS=(3e-4 5e-4)                # Learning rates to sweep
-AUX_LOSS_COEFFS=(0.0 0.1 0.5 1.0)  # Auxiliary loss coefficients (0.0 = no aux loss)
-AUX_LOSS_TARGETS=(0.02 0.05)   # Target activation fraction for auxiliary loss
+EXPANSION_FACTORS=(128)            # Dictionary size = INPUT_DIM * expansion_factor (only for expansion factor 128 and 256)
+SPARSITY_RATIOS=(0.015 0.02 0.025 0.03)   # Sparsity k = dict_size * ratio (rounded to nearest 1024) (only for expansion factor 128 and 256)
+LRS=(3e-4 5e-4)                           # Learning rates to sweep (only for expansion factor 128 and 256)
+AUX_LOSS_COEFFS=(0.1 0.3 0.5)             # Auxiliary loss coefficients (0.0 = no aux loss) (only for expansion factor 128 and 256)
+AUX_LOSS_TARGETS=(0.02)                   # Target activation fraction for auxiliary loss (only for expansion factor 128 and 256)
 
 ####################################################################################################
 
 for ef in "${EXPANSION_FACTORS[@]}"; do
   dict_size=$((INPUT_DIM * ef))
 
-  if [ "${ef}" -eq 32 ]; then
+  if [ "${ef}" -le 32 ]; then
     BATCH_SIZE=${BASE_BATCH_SIZE}
   elif [ "${ef}" -eq 64 ]; then
     BATCH_SIZE=$((BASE_BATCH_SIZE / 2))
@@ -113,11 +121,14 @@ EOF
             uv run torchrun --standalone --nproc_per_node="${NUM_GPUS}" -m EncoderSAE.main \
               --model="${MODEL}" \
               --dataset="${DATASET}" \
+              --dataset_num_samples="${DATASET_NUM_SAMPLES}" \
               --val_dataset="${VAL_DATASET}" \
+              --val_dataset_num_samples="${VAL_DATASET_NUM_SAMPLES}" \
               --val_step="${VAL_STEP}" \
               --expansion_factor="${ef}" \
               --sparsity="${k}" \
               --batch_size="${BATCH_SIZE}" \
+              --activation_batch_size="${ACTIVATION_BATCH_SIZE}" \
               --grad_acc_steps="${GRAD_ACC_STEPS}" \
               --lr="${lr}" \
               --log_steps="${LOG_STEPS}" \
@@ -132,11 +143,14 @@ EOF
             uv run -m EncoderSAE.main \
               --model="${MODEL}" \
               --dataset="${DATASET}" \
+              --dataset_num_samples="${DATASET_NUM_SAMPLES}" \
               --val_dataset="${VAL_DATASET}" \
+              --val_dataset_num_samples="${VAL_DATASET_NUM_SAMPLES}" \
               --val_step="${VAL_STEP}" \
               --expansion_factor="${ef}" \
               --sparsity="${k}" \
               --batch_size="${BATCH_SIZE}" \
+              --activation_batch_size="${ACTIVATION_BATCH_SIZE}" \
               --grad_acc_steps="${GRAD_ACC_STEPS}" \
               --lr="${lr}" \
               --log_steps="${LOG_STEPS}" \

@@ -68,11 +68,41 @@ def setup_wandb(
     if config:
         wandb_config.update(config)
 
-    run = wandb.init(
-        project=project,
-        name=run_name,
-        config=wandb_config,
-    )
+    # Set wandb to online mode explicitly and disable interactive prompts
+    # This prevents blocking during DDP initialization
+    # Only set these if not already set (allow user override)
+    if "WANDB_MODE" not in os.environ:
+        os.environ["WANDB_MODE"] = "online"
+    if "WANDB_SILENT" not in os.environ:
+        os.environ["WANDB_SILENT"] = "true"  # Suppress non-critical output
+
+    # Initialize wandb with non-interactive settings
+    # This prevents prompts that could block rank 0 during DDP setup
+    try:
+        run = wandb.init(
+            project=project,
+            name=run_name,
+            config=wandb_config,
+            mode="online",  # Explicitly set online mode
+            settings=wandb.Settings(
+                _disable_stats=True,  # Disable stats collection that might cause delays
+                console="off",  # Disable console output that might block
+                _disable_meta=True,  # Disable metadata collection
+            ),
+        )
+    except Exception as e:
+        # If wandb init fails (e.g., not authenticated), fall back to offline mode
+        # This prevents the entire run from failing due to wandb issues
+        print(f"Warning: wandb.init() failed: {e}. Falling back to offline mode.")
+        run = wandb.init(
+            project=project,
+            name=run_name,
+            config=wandb_config,
+            mode="offline",  # Fallback to offline
+            settings=wandb.Settings(
+                console="off",
+            ),
+        )
 
     # Explicitly update config to ensure wandb recognizes all values as columns
     # This helps when config values might not show up in the UI automatically

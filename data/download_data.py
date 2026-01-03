@@ -22,8 +22,8 @@ import torch
 # =========================================================
 # 1. Configuration
 # =========================================================
-CACHE_DIR = "/data_x/aa007878/encodersae/data/cache"
-TEMP_DIR = "/data_x/aa007878/encodersae/data/temp_processed"  # Temp directory for per-language files
+CACHE_DIR = "data/cache"
+TEMP_DIR = "data/temp_processed"  # Temp directory for per-language files
 NUM_PROC = 60  # Number of processes for dataset.map operations (per language)
 USE_GPU = (
     torch.cuda.is_available()
